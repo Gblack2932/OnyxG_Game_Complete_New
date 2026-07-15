@@ -288,3 +288,37 @@ HIGH_SCORE_LADDER: str = 'v2'
 HIGH_SCORE_FILE: str = HIGH_SCORE_FILE_V2
 HIGH_SCORE_ENTRIES: int = 3
 HIGH_SCORE_DEFAULT_NAME: str = 'AAA'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DIFFICULTY PRESETS (Future Upgrade)
+# ──────────────────────────────────────────────────────────────────────────────
+# Active preset can be: 'easy', 'normal', or 'hard'
+DIFFICULTY_PRESET: str = 'normal'
+
+# Tuning multipliers used by the main loop to scale challenge and survivability.
+DIFFICULTY_PRESETS: Dict[str, Dict[str, float]] = {
+    'easy': {
+        'enemy_speed_mult': 0.88,
+        'spawn_interval_mult': 1.16,
+        'shoot_prob_mult': 0.78,
+        'boss_health_mult': 0.86,
+        'continue_bonus': 1.0,
+        'player_health_bonus': 1.0,
+    },
+    'normal': {
+        'enemy_speed_mult': 1.0,
+        'spawn_interval_mult': 1.0,
+        'shoot_prob_mult': 1.0,
+        'boss_health_mult': 1.0,
+        'continue_bonus': 0.0,
+        'player_health_bonus': 0.0,
+    },
+    'hard': {
+        'enemy_speed_mult': 1.14,
+        'spawn_interval_mult': 0.88,
+        'shoot_prob_mult': 1.24,
+        'boss_health_mult': 1.18,
+        'continue_bonus': -1.0,
+        'player_health_bonus': -1.0,
+    },
+}

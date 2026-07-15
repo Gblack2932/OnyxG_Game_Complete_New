@@ -27,11 +27,20 @@ from entities import (
 )
 from score import calculate_rank
 from systems import (
+    append_replay_event,
+    build_replay_log_path,
     GameState,
+    current_score_timestamp,
+    display_score_timestamp,
     handle_boss_damage,
     handle_enemy_bullets_vs_player,
+    load_scores,
+    normalize_scores,
     handle_pickups,
     handle_player_bullets_vs_enemies,
+    resolve_score_file,
+    save_replay_log,
+    save_scores,
     handle_side_bullets_vs_enemies,
 )
 
@@ -204,6 +213,91 @@ def load_drone_sheet_sprites(dir_map: Dict[str, str], filename: str,
         ph.fill((180, 60, 60, 200))
         results.append(ph)
     return results
+
+
+def load_level4_enemy_sprites(dir_map: Dict[str, str],
+                              filenames: List[str],
+                              size: Tuple[int, int] = (44, 44)) -> list:
+    """Load Level 4 enemy variants from a two-character promo image.
+
+    The provided art has two enemy units on a shared background. This loader
+    slices left/right halves and removes edge-connected background so each unit
+    can be reused as an in-game sprite.
+    """
+    path = None
+    for name in filenames:
+        path = find_file(dir_map, name)
+        if path:
+            break
+
+    if not path:
+        return []
+
+    try:
+        src = pygame.image.load(path).convert_alpha()
+    except pygame.error as err:
+        print(f"⚠️ Failed to load Level 4 enemies: {err}")
+        return []
+
+    w, h = src.get_size()
+    halves = [
+        src.subsurface(pygame.Rect(0, 0, w // 2, h)).copy(),
+        src.subsurface(pygame.Rect(w // 2, 0, w - (w // 2), h)).copy(),
+    ]
+
+    out = []
+    for half in halves:
+        hw, hh = half.get_size()
+        corner_refs = [
+            half.get_at((0, 0))[:3],
+            half.get_at((hw - 1, 0))[:3],
+            half.get_at((0, hh - 1))[:3],
+            half.get_at((hw - 1, hh - 1))[:3],
+        ]
+
+        def _is_bg(px: int, py: int) -> bool:
+            r, g, b, a = half.get_at((px, py))
+            if a <= 8:
+                return True
+            for br, bg, bb in corner_refs:
+                if abs(r - br) + abs(g - bg) + abs(b - bb) <= 72:
+                    return True
+            return False
+
+        q = deque()
+        seen = set()
+        for x in range(hw):
+            q.append((x, 0))
+            q.append((x, hh - 1))
+        for y in range(hh):
+            q.append((0, y))
+            q.append((hw - 1, y))
+
+        while q:
+            px, py = q.popleft()
+            if (px, py) in seen:
+                continue
+            seen.add((px, py))
+            if not _is_bg(px, py):
+                continue
+
+            half.set_at((px, py), (0, 0, 0, 0))
+            if px > 0:
+                q.append((px - 1, py))
+            if px + 1 < hw:
+                q.append((px + 1, py))
+            if py > 0:
+                q.append((px, py - 1))
+            if py + 1 < hh:
+                q.append((px, py + 1))
+
+        trim = half.get_bounding_rect(min_alpha=1)
+        if trim.width > 0 and trim.height > 0:
+            half = half.subsurface(trim).copy()
+
+        out.append(pygame.transform.smoothscale(half, size))
+
+    return out
 
 
 def load_player_pose_image(dir_map: Dict[str, str], filename: str, size: Tuple[int, int]) -> pygame.Surface:
@@ -458,6 +552,28 @@ def _make_powerup_sound() -> pygame.mixer.Sound:
     stereo = array.array('h', [s for s in samples for _ in range(2)])
     snd = pygame.mixer.Sound(buffer=stereo)
     snd.set_volume(0.55)
+    return snd
+
+
+def _make_signal_burst_sound() -> pygame.mixer.Sound:
+    """Generate a layered low-boom + bright sweep for Signal Burst activation."""
+    sr, dur = 44100, 0.42
+    n = int(sr * dur)
+    attack = max(1, int(sr * 0.012))
+    samples = []
+    for i in range(n):
+        t = i / sr
+        atk = min(1.0, i / attack)
+        env = atk * math.exp(-4.2 * t)
+        boom = math.sin(2 * math.pi * (62.0 - 18.0 * t) * t)
+        sweep_freq = 1250.0 - (900.0 * min(1.0, t / dur))
+        sweep = math.sin(2 * math.pi * sweep_freq * t)
+        fizz = random.uniform(-1.0, 1.0) * math.exp(-11.0 * t)
+        v = (0.66 * boom + 0.38 * sweep + 0.22 * fizz) * env
+        samples.append(max(-32768, min(32767, int(v * 30000))))
+    stereo = array.array('h', [s for s in samples for _ in range(2)])
+    snd = pygame.mixer.Sound(buffer=stereo)
+    snd.set_volume(0.7)
     return snd
 
 
@@ -931,6 +1047,230 @@ def _level_two_transition(screen: pygame.Surface, clock: pygame.time.Clock,
     pygame.mixer.music.set_volume(_orig_vol)
 
 
+def _level_three_transition(screen: pygame.Surface, clock: pygame.time.Clock,
+                            background_img: pygame.Surface) -> None:
+    """Cinematic bridge between Level 2 clear and Level 3 start."""
+    W, H = screen.get_size()
+    _ft  = pygame.font.SysFont("Arial", 72, bold=True)
+    _fs  = pygame.font.SysFont("Arial", 32, bold=True)
+    _clear_surf  = _ft.render("LEVEL 2  CLEAR", True, (255, 180, 60))
+    _l3_surf     = _ft.render("LEVEL 3", True, (255, 180, 0))
+
+    # Fit clear text if too wide
+    if _clear_surf.get_width() > W - 80:
+        _clear_surf = pygame.font.SysFont("Arial", 48, bold=True).render("LEVEL 2  CLEAR", True, (255, 180, 60))
+
+    _sub_surf    = _fs.render("APEX  MODE  ACTIVATED", True, (255, 220, 100))
+    _black       = pygame.Surface((W, H))
+    _black.fill((0, 0, 0))
+
+    # Phases: fade-to-black | hold clear | crossfade to L3 bg | L3 reveal | fade out
+    _P = [30, 40, 25, 50, 25]
+    _ends = [sum(_P[:i + 1]) for i in range(len(_P))]
+    _TOTAL = _ends[-1]
+
+    _orig_vol = pygame.mixer.music.get_volume()
+    pygame.mixer.music.set_volume(max(0.0, _orig_vol * 0.3))
+
+    for _f in range(_TOTAL):
+        for _ev in pygame.event.get():
+            if _ev.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+
+        if _f < _ends[0]:
+            # Fade to black
+            t = _f / _P[0]
+            screen.blit(screen, (0, 0))
+            _black.set_alpha(int(255 * t))
+            screen.blit(_black, (0, 0))
+
+        elif _f < _ends[1]:
+            # Hold black, show LEVEL 2 CLEAR fading in then out
+            t = (_f - _ends[0]) / _P[1]
+            screen.blit(_black, (0, 0))
+            _a = 255 * (1.0 - (t - 0.5) ** 2 * 4) if 0 <= t <= 1 else 0
+            _clear_surf.set_alpha(max(0, min(255, _a)))
+            screen.blit(_clear_surf, _clear_surf.get_rect(center=(W // 2, H // 2)))
+
+        elif _f < _ends[2]:
+            # Crossfade Level 3 background in
+            t = (_f - _ends[1]) / _P[2]
+            screen.blit(_black, (0, 0))
+            screen.blit(background_img, (0, 0))
+            _black.set_alpha(int(255 * (1.0 - t) ** 2))
+            screen.blit(_black, (0, 0))
+
+        elif _f < _ends[3]:
+            # Hold: show LEVEL 3 title + subtitle fading in
+            t = (_f - _ends[2]) / _P[3]
+            screen.blit(background_img, (0, 0))
+            _pulse = 220 if PHOTOSENSITIVE_SAFE_MODE else int(240 + 40 * abs(math.sin(_f * 0.12)))
+            _l3c = pygame.font.SysFont("Arial", 72, bold=True).render("LEVEL 3", True, (255, _pulse // 2, 0))
+            screen.blit(_l3c, _l3c.get_rect(center=(W // 2, H // 2 - 50)))
+            if t > 0.15:
+                _sa = min(255, int((t - 0.15) / 0.3 * 255))
+                _sub_surf.set_alpha(_sa)
+                screen.blit(_sub_surf, _sub_surf.get_rect(center=(W // 2, H // 2 + 18)))
+
+        else:
+            # Fade out overlays (background stays, gameplay starts)
+            t = (_f - _ends[3]) / _P[4]
+            screen.blit(background_img, (0, 0))
+            _sub_surf.set_alpha(max(0, int(255 * (1.0 - t))))
+            screen.blit(_sub_surf, _sub_surf.get_rect(center=(W // 2, H // 2 + 18)))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.mixer.music.set_volume(_orig_vol)
+
+
+def _level_four_transition(screen: pygame.Surface, clock: pygame.time.Clock,
+                           background_img: pygame.Surface) -> None:
+    """Cinematic bridge into Level 4 with title reveal only."""
+    W, H = screen.get_size()
+    _title_f = pygame.font.SysFont("Arial", 72, bold=True)
+    _line_f = pygame.font.SysFont("Arial", 26, bold=True)
+
+    _sub_surf = _line_f.render("FINAL ASCENT  •  MAX THREAT", True, (255, 245, 170))
+    _hint_surf = _line_f.render("SURVIVE THE DRONE ONSLAUGHT", True, (210, 240, 255))
+
+    _black = pygame.Surface((W, H), pygame.SRCALPHA)
+    _dialog_ov = pygame.Surface((W, H), pygame.SRCALPHA)
+
+    # Phases: darken -> title reveal -> hold -> fade out
+    _P = [28, 56, 72, 26]
+    _ends = [sum(_P[:i + 1]) for i in range(len(_P))]
+    _TOTAL = _ends[-1]
+
+    _orig_vol = pygame.mixer.music.get_volume()
+    pygame.mixer.music.set_volume(max(0.0, _orig_vol * 0.35))
+
+    for _f in range(_TOTAL):
+        for _ev in pygame.event.get():
+            if _ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+
+        screen.blit(background_img, (0, 0))
+        _dialog_ov.fill((0, 0, 0, 0))
+
+        if _f < _ends[0]:
+            t = _f / _P[0]
+            _black.fill((0, 0, 0, int(190 * (1.0 - t))))
+            screen.blit(_black, (0, 0))
+
+        elif _f < _ends[1]:
+            t = (_f - _ends[0]) / _P[1]
+            _pulse = 210 if PHOTOSENSITIVE_SAFE_MODE else int(220 + 35 * abs(math.sin(_f * 0.18)))
+            _l4c = _title_f.render("LEVEL 4", True, (160, _pulse, 255))
+            _l4c.set_alpha(min(255, int(255 * (0.35 + t))))
+            screen.blit(_l4c, _l4c.get_rect(center=(W // 2, H // 2 - 76)))
+            if t > 0.24:
+                _sa = min(255, int((t - 0.24) / 0.5 * 255))
+                _sub_surf.set_alpha(_sa)
+                screen.blit(_sub_surf, _sub_surf.get_rect(center=(W // 2, H // 2 - 24)))
+
+        elif _f < _ends[2]:
+            t = (_f - _ends[1]) / _P[2]
+            _dialog_ov.fill((10, 6, 16, 175 if PHOTOSENSITIVE_SAFE_MODE else 200))
+            screen.blit(_dialog_ov, (0, 0))
+            _title_alpha = min(255, int((0.4 + 0.6 * t) * 255))
+            _l4c = _title_f.render("LEVEL 4", True, (160, 230, 255))
+            _l4c.set_alpha(_title_alpha)
+            _sub_surf.set_alpha(_title_alpha)
+            _hint_surf.set_alpha(_title_alpha)
+            screen.blit(_l4c, _l4c.get_rect(center=(W // 2, H // 2 - 72)))
+            screen.blit(_sub_surf, _sub_surf.get_rect(center=(W // 2, H // 2 - 22)))
+            screen.blit(_hint_surf, _hint_surf.get_rect(center=(W // 2, H // 2 + 24)))
+
+        else:
+            t = (_f - _ends[2]) / _P[3]
+            _black.fill((0, 0, 0, int(190 * t)))
+            screen.blit(_black, (0, 0))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.mixer.music.set_volume(_orig_vol)
+
+
+def _oracle_victory_message(screen: pygame.Surface, clock: pygame.time.Clock,
+                            background_img: pygame.Surface,
+                            oracle_img: pygame.Surface,
+                            onyx_img: pygame.Surface) -> None:
+    """Post-Level-4 Oracle-only message before final win screen."""
+    W, H = screen.get_size()
+    _name_f = pygame.font.SysFont("Arial", 30, bold=True)
+    _line_f = pygame.font.SysFont("Arial", 24, bold=True)
+    # High-contrast palette so dialogue remains legible over bright speech bubble fills.
+    _oracle_tag = _name_f.render("ORACLE ALLIE", True, (132, 58, 180))
+    _line1 = _line_f.render("Onyx G, your victory echoes through the realm.", True, (38, 28, 62))
+    _line2 = _line_f.render("The ancestral gates are open to you.", True, (38, 28, 62))
+    _oracle_tag_shadow = _name_f.render("ORACLE ALLIE", True, (12, 8, 26))
+    _line1_shadow = _line_f.render("Onyx G, your victory echoes through the realm.", True, (12, 8, 26))
+    _line2_shadow = _line_f.render("The ancestral gates are open to you.", True, (12, 8, 26))
+
+    _ov = pygame.Surface((W, H), pygame.SRCALPHA)
+    _bubble = pygame.Surface((560, 190), pygame.SRCALPHA)
+    _P = [24, 84, 70, 28]
+    _ends = [sum(_P[:i + 1]) for i in range(len(_P))]
+    _TOTAL = _ends[-1]
+
+    _orig_vol = pygame.mixer.music.get_volume()
+    pygame.mixer.music.set_volume(max(0.0, _orig_vol * 0.42))
+
+    for _f in range(_TOTAL):
+        for _ev in pygame.event.get():
+            if _ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+
+        screen.blit(background_img, (0, 0))
+        _ov.fill((8, 8, 18, 170 if PHOTOSENSITIVE_SAFE_MODE else 200))
+        screen.blit(_ov, (0, 0))
+        screen.blit(onyx_img, onyx_img.get_rect(midbottom=(W // 2 - 200, H - 18)))
+        screen.blit(oracle_img, oracle_img.get_rect(midbottom=(W // 2 + 220, H - 18)))
+
+        _bubble.fill((0, 0, 0, 0))
+        _br = pygame.Rect(12, 12, 536, 160)
+        pygame.draw.rect(_bubble, (252, 244, 255), _br, border_radius=34)
+        pygame.draw.rect(_bubble, (255, 170, 255), _br, 4, border_radius=34)
+        pygame.draw.rect(_bubble, (241, 229, 252), _br.inflate(-16, -16), border_radius=28)
+        _tail = [(468, 166), (520, 186), (442, 160)]
+        pygame.draw.polygon(_bubble, (252, 244, 255), _tail)
+        pygame.draw.polygon(_bubble, (255, 170, 255), _tail, 4)
+
+        _alpha = 255
+        if _f < _ends[0]:
+            _alpha = int(255 * (_f / max(1, _P[0])))
+        elif _f > _ends[2]:
+            _alpha = int(255 * max(0.0, 1.0 - ((_f - _ends[2]) / max(1, _P[3]))))
+        _bubble.set_alpha(max(0, min(255, _alpha)))
+
+        _pos = _bubble.get_rect(center=(W // 2 - 10, H // 2 - 70))
+        screen.blit(_bubble, _pos)
+        _oracle_tag.set_alpha(_bubble.get_alpha())
+        _oracle_tag_shadow.set_alpha(_bubble.get_alpha())
+        _line1.set_alpha(_bubble.get_alpha())
+        _line1_shadow.set_alpha(_bubble.get_alpha())
+        _line2.set_alpha(_bubble.get_alpha())
+        _line2_shadow.set_alpha(_bubble.get_alpha())
+        _tag_pos = _oracle_tag.get_rect(center=(_pos.centerx, _pos.top + 44))
+        _line1_pos = _line1.get_rect(center=(_pos.centerx, _pos.top + 88))
+        _line2_pos = _line2.get_rect(center=(_pos.centerx, _pos.top + 122))
+        screen.blit(_oracle_tag_shadow, _tag_pos.move(2, 2))
+        screen.blit(_oracle_tag, _tag_pos)
+        screen.blit(_line1_shadow, _line1_pos.move(2, 2))
+        screen.blit(_line1, _line1_pos)
+        screen.blit(_line2_shadow, _line2_pos.move(2, 2))
+        screen.blit(_line2, _line2_pos)
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.mixer.music.set_volume(_orig_vol)
+
+
 def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose=False,
                    block_signal=0, continues_used=0, leaderboard_label='V2'):
     """Show win or lose image. Returns 'restart' or 'menu'."""
@@ -1158,7 +1498,10 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
             _, _hdr = _fit_render(f'TOP SCORES ({leaderboard_label})', (180, 80, 255), _sf2_size,
                                   monitor_safe.width - 12, min_size=13)
             screen.blit(_hdr, _hdr.get_rect(center=(_lbx, _lby)))
-            for _ri, (_rs, _rn) in enumerate(scores):
+            for _ri, _row in enumerate(scores):
+                _rs = int(_row[0]) if len(_row) > 0 else 0
+                _rn = str(_row[1]) if len(_row) > 1 else cfg.HIGH_SCORE_DEFAULT_NAME
+                _rt = display_score_timestamp(str(_row[2])) if len(_row) > 2 else ""
                 _col = _RANK_COLS[_ri]
                 _hl  = (score > 0 and _ri == 0 and score >= _top_score)
                 _tc  = (255, 255, 255) if _hl else _col
@@ -1167,8 +1510,11 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
                     _name_max = monitor_safe.width - 170
                     pygame.draw.circle(screen, _col, (_lbx - 120, _ry), 10)
                     pygame.draw.circle(screen, (0, 0, 0), (_lbx - 120, _ry), 6)
-                    _row = _sf2.render(f"{_RANK_LBLS[_ri]}  {_rn}  {_rs:,}", True, _tc)
-                    screen.blit(_row, _row.get_rect(midleft=(_lbx - 102, _ry - 10)))
+                    _row_surf = _sf2.render(f"{_RANK_LBLS[_ri]}  {_rn}  {_rs:,}", True, _tc)
+                    screen.blit(_row_surf, _row_surf.get_rect(midleft=(_lbx - 102, _ry - 10)))
+                    if _rt:
+                        _t_small = _get_arcade_font(11).render(_rt, True, (160, 160, 160))
+                        screen.blit(_t_small, _t_small.get_rect(midleft=(_lbx + 8, _ry + 10)))
                 else:
                     _ry  = win_board_top_y + _ri * _win_row_gap
                     _row_left = monitor_safe.left + 14
@@ -1187,6 +1533,9 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
                     _, _score_surf = _fit_arcade_plain(f"{_rs:,}", 16, 82, _col, min_size=11)
                     screen.blit(_name_surf, _name_surf.get_rect(midleft=(_name_left, _ry)))
                     screen.blit(_score_surf, _score_surf.get_rect(midright=(_score_anchor, _ry)))
+                    if _rt:
+                        _, _time_surf = _fit_arcade_plain(_rt, 11, 126, (150, 150, 150), min_size=9)
+                        screen.blit(_time_surf, _time_surf.get_rect(midright=(_score_anchor - 92, _ry + 12)))
         mx, my = pygame.mouse.get_pos()
         _hover_try = try_rect.collidepoint(mx, my)
         _hover_menu = menu_rect.collidepoint(mx, my)
@@ -1360,7 +1709,7 @@ def _name_entry_screen(screen, clock, font_big, font_med, font,
         _RANK_LABELS = ['1ST', '2ND', '3RD']
         # Build preview with new entry inserted at the earned rank
         _preview = [list(s) for s in scores]
-        _preview.insert(place - 1, [new_score, confirmed_name])
+        _preview.insert(place - 1, [new_score, confirmed_name, current_score_timestamp()])
         _preview = _preview[:3]
         _hof_timer = 0
         while _hof_timer < 240:          # ~4 s; any key exits early
@@ -1383,7 +1732,10 @@ def _name_entry_screen(screen, clock, font_big, font_med, font,
             _row_start_y = _cab_safe.top + int(_cab_safe.height * 0.34)
             _row_gap = max(36, int(_cab_safe.height * 0.17))
 
-            for _ri, (_rs, _rn) in enumerate(_preview):
+            for _ri, _row in enumerate(_preview):
+                _rs = int(_row[0]) if len(_row) > 0 else 0
+                _rn = str(_row[1]) if len(_row) > 1 else cfg.HIGH_SCORE_DEFAULT_NAME
+                _rt = display_score_timestamp(str(_row[2])) if len(_row) > 2 else ""
                 _ry  = _row_start_y + _ri * _row_gap
                 _col = _RANK_COLS[_ri]
                 _new = (_ri == place - 1)
@@ -1404,6 +1756,9 @@ def _name_entry_screen(screen, clock, font_big, font_med, font,
                 screen.blit(name_s, name_s.get_rect(midleft=(_name_left, _ry)))
                 _, sc_s = _fit_arcade_color(f'{_rs:,}', 92, 16, _col, min_size=11)
                 screen.blit(sc_s, sc_s.get_rect(midright=(_score_right, _ry)))
+                if _rt:
+                    _, ts_s = _fit_arcade_color(_rt, 126, 11, (150, 150, 150), min_size=9)
+                    screen.blit(ts_s, ts_s.get_rect(midright=(_score_right - 96, _ry + 12)))
 
             cont_font = _get_arcade_font(14)
             cont_s = cont_font.render('Press any key to continue\u2026', True, (110, 110, 110))
@@ -1438,29 +1793,6 @@ def build_rage_vignette(width: int, height: int, color: Tuple[int, int, int], ba
     return surf
 
 
-def _normalize_scores(raw_scores: List[List[Any]], entries: int, default_name: str) -> List[List[Any]]:
-    """Return a canonical top-score table sorted high-to-low and safely shaped."""
-    normalized: List[List[Any]] = []
-    for row in raw_scores:
-        try:
-            _score = max(0, int(row[0]))
-        except (TypeError, ValueError, IndexError):
-            _score = 0
-        try:
-            _name = str(row[1]).strip().upper()[:3]
-        except (TypeError, ValueError, IndexError):
-            _name = ""
-        if not _name:
-            _name = default_name
-        normalized.append([_score, _name])
-
-    normalized.sort(key=lambda s: s[0], reverse=True)
-    normalized = normalized[:entries]
-    while len(normalized) < entries:
-        normalized.append([0, default_name])
-    return normalized
-
-
 def main() -> None:
     """
     Main game loop initialization and execution.
@@ -1475,6 +1807,7 @@ def main() -> None:
                           cfg.AUDIO_INIT_CHANNELS, cfg.AUDIO_INIT_BUFFER)
     pygame.init()
     impact_channel = pygame.mixer.Channel(0)  # dedicated channel — never dropped
+    burst_channel = pygame.mixer.Channel(1)   # dedicated channel for signal burst punch
 
     WIDTH, HEIGHT = cfg.WIDTH, cfg.HEIGHT
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -1501,12 +1834,49 @@ def main() -> None:
     sprite_image       = sprite_idle_image
     drone_image    = load_image(dir_map, "drone_spaceship.png",   (40, 40))
     drone_images_level_2 = load_drone_sheet_sprites(dir_map, "Drones Level 2 .png", (44, 44))
+    drone_images_level_4 = load_level4_enemy_sprites(
+        dir_map,
+        [
+            "Level_4_enemies .png",
+            "Level_4_enemies.png",
+            "Level 4 enemies .png",
+            "Level 4 enemies.png",
+        ],
+        (46, 46),
+    )
+    if not drone_images_level_4:
+        drone_images_level_4 = drone_images_level_2
     minion_image   = load_image(dir_map, "tibbixel-dot-com-4947-wpng 2.png", (32, 32))
     boss_image_level_1 = load_image(dir_map, "cranium_commander 2.png", (100, 100))
     boss_image_level_2 = load_image(dir_map, "Agent boss Level 2.png", (124, 124))
+    boss_image_level_3 = load_image(dir_map, "Level 3 Boss.png", (140, 140))
+    _boss_level4_file = (
+        find_file(dir_map, "Level_4_Boss.png")
+        or find_file(dir_map, "Level 4 Boss.png")
+        or find_file(dir_map, "Boss Level 4.png")
+        or find_file(dir_map, "Ancestor Boss.png")
+    )
+    if _boss_level4_file:
+        boss_image_level_4 = load_image(dir_map, os.path.basename(_boss_level4_file), (152, 152))
+    else:
+        boss_image_level_4 = boss_image_level_3
+    ancestor_allie_img = load_image(dir_map, "Ancestor_allie .png", (170, 170))
+    oracle_allie_img = load_image(dir_map, "Oracle_allie .png", (170, 170))
     water_image   = load_image_tight(dir_map, "gg_water_new .png", (40, 40))
     background_img_level_1 = load_image_cover(dir_map, "space_background.png", (WIDTH, HEIGHT))
     background_img_level_2 = load_image_cover(dir_map, "Level 2 .png", (WIDTH, HEIGHT))
+    background_img_level_3 = load_image_cover(dir_map, "Level_3.png", (WIDTH, HEIGHT))
+    _level4_bg_file = (
+        find_file(dir_map, "Level_4_scene .png")
+        or find_file(dir_map, "Level_4_scene.png")
+        or find_file(dir_map, "Level_4.png")
+        or find_file(dir_map, "Level 4.png")
+        or find_file(dir_map, "Ancestral Realm.png")
+    )
+    if _level4_bg_file:
+        background_img_level_4 = load_image_cover(dir_map, os.path.basename(_level4_bg_file), (WIDTH, HEIGHT))
+    else:
+        background_img_level_4 = background_img_level_3
     menu_img       = load_image(dir_map, "Start Menu 3.png", (WIDTH, HEIGHT))
     win_img        = load_image(dir_map, "Win Scene 3.png",      (WIDTH, HEIGHT))
     lose_img       = load_image(dir_map, "Lose Screen 3.png",    (WIDTH, HEIGHT))
@@ -1529,6 +1899,26 @@ def main() -> None:
         print(f"🎶 Level 2 music ready: {os.path.basename(level2_music_file)}")
     else:
         print("⚠️ No dedicated Level 2 music found. Level 1 BGM will continue.")
+    
+    level3_music_file = (
+        find_file(dir_map, "Level_3_music.ogg")
+        or find_file(dir_map, "Level_3_Music.ogg")
+        or find_file(dir_map, "Level 3 music.ogg")
+    )
+    if level3_music_file:
+        print(f"🎶 Level 3 music ready: {os.path.basename(level3_music_file)}")
+    else:
+        print("⚠️ No dedicated Level 3 music found. Level 2 BGM will continue.")
+    level4_music_file = (
+        find_file(dir_map, "Level_4_music.ogg")
+        or find_file(dir_map, "Level 4 music.ogg")
+        or find_file(dir_map, "Ancestral Realm music.ogg")
+    )
+    if level4_music_file:
+        print(f"🎶 Level 4 music ready: {os.path.basename(level4_music_file)}")
+    else:
+        print("⚠️ No dedicated Level 4 music found. Level 3 BGM will continue.")
+    
     current_bgm_tag = "level1"
 
     win_music_file = find_file(dir_map, "WinScene music.ogg")
@@ -1563,6 +1953,25 @@ def main() -> None:
         except Exception as err:
             impact_sound = None
             print(f"⚠️ Impact sound disabled: {err}")
+
+    signal_burst_sound = None
+    _signal_burst_sf = (
+        find_file(dir_map, "Signal Burst sound.ogg")
+        or find_file(dir_map, "Signal burst sound.ogg")
+        or find_file(dir_map, "Signal Burst.ogg")
+    )
+    if _signal_burst_sf:
+        try:
+            signal_burst_sound = pygame.mixer.Sound(_signal_burst_sf)
+            signal_burst_sound.set_volume(min(1.0, cfg.VOLUME_IMPACT_SOUND * 1.25))
+        except pygame.error as err:
+            print(f"⚠️ Signal burst sound asset failed, using synth fallback: {err}")
+    if signal_burst_sound is None:
+        try:
+            signal_burst_sound = _make_signal_burst_sound()
+        except Exception as err:
+            signal_burst_sound = impact_sound
+            print(f"⚠️ Signal burst sound fallback disabled: {err}")
 
     try:
         siren_sound = _make_siren_sound()
@@ -1630,6 +2039,7 @@ def main() -> None:
     _kflash_surf.fill((255, 0, 0, 70 if PHOTOSENSITIVE_SAFE_MODE else 140))
     _dflash_surf      = pygame.Surface((40, 40), pygame.SRCALPHA)
     _dflash_surf.fill((0, 220, 255, 60 if PHOTOSENSITIVE_SAFE_MODE else 130))
+    _signal_ring_surf = pygame.Surface((420, 420), pygame.SRCALPHA)
     _water_glow_surf   = pygame.Surface((72, 72), pygame.SRCALPHA)
     _boss_tint_surf   = pygame.Surface((100, 100), pygame.SRCALPHA)
     _sprite_glow_surf = pygame.Surface((240, 240), pygame.SRCALPHA)
@@ -1638,7 +2048,7 @@ def main() -> None:
     _heart_grey_h = font.render("\u2665", True, (70, 70, 70))
     _block_lbl_h  = font.render('BLOCK SIGNAL', True, (180, 220, 255))
     _signal_lbl_h = font.render('SIGNAL BURST', True, (190, 120, 255))
-    _sativa_lbl_h = font.render('\u2605 BOTTLED WATER', True, (70, 180, 255))
+    _sativa_lbl_h = font.render('\u2605 HYDRATED', True, (70, 180, 255))
     _shake_surf   = pygame.Surface((WIDTH, HEIGHT))  # no SRCALPHA; plain pixel copy
     # Dirty caches for text that rarely changes
     _score_cache = {'val': -1, 'surf': None}
@@ -1650,6 +2060,7 @@ def main() -> None:
     _combo_cache  = {'val': None, 'surf': None}    # combo counter text cache
     _block_pct_cache = {'val': None, 'col': None, 'surf': None}
     _signal_pct_cache = {'val': None, 'col': None, 'surf': None}
+    _enemy_roll_cache = {}
     # Banner cache avoids repeated font.render/_fit_banner_text in the render hot path.
     _banner_cache = {
         'wave_intro': {'key': None, 'title': None, 'mult': None},
@@ -1664,6 +2075,22 @@ def main() -> None:
         base_size=34,
         min_size=18,
     )
+    _level3_intro_title = _fit_banner_text('LEVEL 3', (255, 180, 0), WIDTH - 120)
+    _level3_intro_sub = _fit_banner_text(
+        'APEX MODE  •  ULTIMATE CHALLENGE',
+        (255, 240, 120),
+        WIDTH - 120,
+        base_size=34,
+        min_size=18,
+    )
+    _level4_intro_title = _fit_banner_text('LEVEL 4', (170, 230, 255), WIDTH - 120)
+    _level4_intro_sub = _fit_banner_text(
+        'ANCESTRAL PROTECTION  •  FINAL ASCENT',
+        (210, 255, 230),
+        WIDTH - 120,
+        base_size=34,
+        min_size=18,
+    )
     # Pre-rendered static banner surfaces (text/color never change)
     _brage_surf      = font_big.render('\u2620  RAGE  MODE  \u2620', True, (255, 40, 40))
     _warn_text_surf  = font_big.render('\u26a0  WARNING  \u26a0', True, (255, 50, 50))
@@ -1671,6 +2098,20 @@ def main() -> None:
     _trauma_text_surf = font_big.render('TRAUMA MODE', True, (255, 90, 90))
     _ready_title_safe_surf = font_big.render('PLAYER 1', True, (255, 210, 0))
     _ready_sub_surf = font_big.render('GET  READY!', True, (255, 255, 255))
+    _l4_story_allie_name_surf = font_med.render('ANCESTOR ALLIE', True, (54, 118, 158))
+    _l4_story_allie_line_surf = font.render('Onyx G, you have done well.', True, (30, 26, 58))
+    _l4_story_oracle_name_surf = font_med.render('ORACLE ALLIE', True, (132, 58, 180))
+    _l4_story_oracle_line_surf = font.render('You have earned protection from the ancestral realm.', True, (30, 26, 58))
+    _l4_story_bless_name_surf = font_med.render('ANCESTRAL BLESSING', True, (34, 126, 88))
+    _l4_story_bless_line_surf = font.render('+3 ancestral guard charges active.', True, (30, 26, 58))
+    _l4_story_allie_name_shadow = font_med.render('ANCESTOR ALLIE', True, (10, 8, 24))
+    _l4_story_allie_line_shadow = font.render('Onyx G, you have done well.', True, (10, 8, 24))
+    _l4_story_oracle_name_shadow = font_med.render('ORACLE ALLIE', True, (10, 8, 24))
+    _l4_story_oracle_line_shadow = font.render('You have earned protection from the ancestral realm.', True, (10, 8, 24))
+    _l4_story_bless_name_shadow = font_med.render('ANCESTRAL BLESSING', True, (10, 8, 24))
+    _l4_story_bless_line_shadow = font.render('+3 ancestral guard charges active.', True, (10, 8, 24))
+    _l4_bubble_surf = pygame.Surface((520, 170), pygame.SRCALPHA)
+    _l4_bubble_small_surf = pygame.Surface((450, 150), pygame.SRCALPHA)
     # Pre-built rage vignette surfaces (static geometry, only two variants)
     _rage_vignette_cache = {
         'normal':   build_rage_vignette(WIDTH, HEIGHT, (200, 0, 0), 70),
@@ -1679,6 +2120,17 @@ def main() -> None:
 
     # ── Constants ─────────────────────────────────────────────────────────────
     SPEED                = 5
+    # Player movement feel
+    PLAYER_ACCELERATION = 0.88
+    PLAYER_DECELERATION = 0.74
+    PLAYER_TURN_ACCEL_MULT = 1.30
+    PLAYER_MAX_NORMAL_SPEED = 9.0
+    PLAYER_MAX_POWER_SPEED = 11.5
+    PLAYER_KILL_BOOST_AMOUNT = 0.35
+    PLAYER_KILL_BOOST_FRAMES = 75
+    PLAYER_NEAR_MISS_BOOST = 0.22
+    PLAYER_NEAR_MISS_FRAMES = 36
+    PLAYER_BOOST_MAX = 1.10
     FIREBALL_SPEED       = 10
     ENEMY_SPEED          = 2
     ENEMY_SPAWN_INTERVAL = 60
@@ -1696,6 +2148,54 @@ def main() -> None:
     LEVEL_2_SPEED_MULT_CURVE = [1.15, 1.25, 1.40, 1.55, 1.70]
     LEVEL_2_INTERVAL_MULT_CURVE = [0.92, 0.84, 0.76, 0.69, 0.63]
     LEVEL_2_BULLET_BONUS_CURVE = [0.40, 0.70, 1.00, 1.30, 1.60]
+    # Level 3 (elite challenge): aggressive from wave 1, peaks at wave 5
+    LEVEL_3_SPEED_MULT   = 1.55
+    LEVEL_3_INTERVAL_MULT = 0.62
+    LEVEL_3_BULLET_BONUS = 1.5
+    LEVEL_3_SPEED_MULT_CURVE = [1.35, 1.48, 1.62, 1.76, 1.90]
+    LEVEL_3_INTERVAL_MULT_CURVE = [0.80, 0.72, 0.62, 0.55, 0.50]
+    LEVEL_3_BULLET_BONUS_CURVE = [0.70, 1.10, 1.50, 1.90, 2.30]
+    # Level 4 (ancestral gauntlet): hardest pacing in the run.
+    LEVEL_4_SPEED_MULT_CURVE = [1.52, 1.66, 1.80, 1.95, 2.10]
+    LEVEL_4_INTERVAL_MULT_CURVE = [0.70, 0.62, 0.56, 0.51, 0.46]
+    LEVEL_4_BULLET_BONUS_CURVE = [1.00, 1.45, 1.95, 2.40, 2.85]
+    # NPC AI tuning
+    NPC_SEPARATION_RADIUS = 44.0
+    NPC_SEPARATION_FORCE = 0.42
+    NPC_REACTION_FRAMES = {
+        1: (18, 30),
+        2: (13, 24),
+        3: (9, 18),
+        4: (7, 14),
+    }
+    MAX_AIMED_PROJECTILES = {1: 1, 2: 2, 3: 3, 4: 4}
+    MAX_HUNTER_SPEED_RATIO = 0.92
+    MAX_KAMIKAZE_SPEED_RATIO = 1.18
+    ROLE_SHOT_COOLDOWNS = {
+        'drifter': (70, 120),
+        'tracker': (55, 95),
+        'flanker': (48, 82),
+        'gunner': (34, 62),
+        'hunter': (30, 54),
+    }
+    # Gore constants
+    GORE_ENABLED = True
+    GORE_INTENSITY = 1.20
+    MAX_BLOOD_DROPLETS = 150
+    MAX_BLOOD_CHUNKS = 30
+    MAX_BLOOD_DECALS = 48
+    BLOOD_GRAVITY = 0.16
+    BLOOD_DRAG = 0.985
+    BLOOD_TRAIL_ALPHA = 96
+    BLOOD_WET_FRAMES = 140
+    BLOOD_POOL_CHANCE = 0.10
+    BLOOD_COLORS = [
+        (112, 0, 12),
+        (145, 5, 18),
+        (82, 0, 8),
+        (165, 18, 22),
+        (58, 0, 8),
+    ]
     MAX_PARTICLES = 220
     MAX_SCORE_POPUPS = 24
     MAX_DATA_SOULS = 20
@@ -1724,6 +2224,19 @@ def main() -> None:
     WAVE_DIVE_BATCH = cfg.WAVE_DIVE_BATCH
     PERKS = cfg.PERKS
 
+    _difficulty_key = str(getattr(cfg, 'DIFFICULTY_PRESET', 'normal')).lower()
+    _difficulty = cfg.DIFFICULTY_PRESETS.get(_difficulty_key, cfg.DIFFICULTY_PRESETS['normal'])
+    enemy_speed_scale = float(_difficulty.get('enemy_speed_mult', 1.0))
+    spawn_interval_scale = float(_difficulty.get('spawn_interval_mult', 1.0))
+    shoot_prob_scale = float(_difficulty.get('shoot_prob_mult', 1.0))
+    boss_health_scale = float(_difficulty.get('boss_health_mult', 1.0))
+    continue_bonus = int(_difficulty.get('continue_bonus', 0.0))
+    player_health_bonus = int(_difficulty.get('player_health_bonus', 0.0))
+    max_continues = max(0, cfg.CONTINUE_MAX_USES + continue_bonus)
+
+    def _scaled_boss_health(base_value: int) -> int:
+        return max(1, int(round(base_value * boss_health_scale)))
+
     def _pull_runtime_scalars(state: GameState):
         """Single sync point for mutable scalar values edited by systems."""
         return (
@@ -1736,32 +2249,130 @@ def main() -> None:
             state.iframe_timer,
         )
 
+    def _approach_vector(current, target, max_delta):
+        """Move current vector toward target by at most max_delta."""
+        delta = target - current
+        if delta.length_squared() == 0:
+            return target.copy()
+        if delta.length() <= max_delta:
+            return target.copy()
+        return current + delta.normalize() * max_delta
+
+    def _make_enemy_profile(current_level, current_wave):
+        """Create an AI behavior profile for a new enemy."""
+        if current_level == 1:
+            roles = ['drifter', 'tracker', 'flanker', 'gunner']
+            weights = [58, 27, 7, 8]
+        elif current_level == 2:
+            roles = ['drifter', 'tracker', 'flanker', 'gunner']
+            weights = [38, 30, 16, 16]
+        elif current_level == 3:
+            roles = ['drifter', 'tracker', 'flanker', 'gunner']
+            weights = [24, 30, 23, 23]
+        else:
+            roles = ['tracker', 'flanker', 'gunner', 'hunter']
+            weights = [22, 24, 24, 30]
+        role = random.choices(roles, weights=weights, k=1)[0]
+        rmin, rmax = NPC_REACTION_FRAMES[current_level]
+        return {
+            'role': role,
+            'reaction_frames': random.randint(rmin, rmax),
+            'shot_cd': random.randint(28, 70),
+            'strafe_dir': random.choice((-1, 1)),
+            'flank_offset': random.choice((-220, -170, 170, 220)),
+            'phase': random.uniform(0.0, math.tau),
+        }
+
+    def _spawn_enemy(x, y):
+        """Spawn an enemy with AI profile assigned."""
+        enemy = Enemy(
+            rect=pygame.Rect(int(x), int(y), 40, 40),
+            angle=random.uniform(0, 2 * math.pi),
+        )
+        enemies.append(enemy)
+        enemy_ai_profiles[id(enemy)] = _make_enemy_profile(level, wave)
+        return enemy
+
+    def _spawn_blood_burst(
+            cx,
+            cy,
+            intensity=1.0,
+            bias=(0.0, 0.0),
+            stains=1,
+            wet_frames=None,
+            gloss_scale=1.0,
+            decal_life_scale=1.0):
+        """Spawn gore particles (droplets, chunks, decals) at a location."""
+        if not GORE_ENABLED:
+            return
+        total = max(1, int(random.randint(12, 18) * intensity * GORE_INTENSITY))
+        bx, by = bias
+        _wet_frames = BLOOD_WET_FRAMES if wet_frames is None else max(0, int(wet_frames))
+        _decal_life_scale = max(0.2, float(decal_life_scale))
+        _gloss_scale = max(0.2, float(gloss_scale))
+        for _ in range(total):
+            angle = random.uniform(0.0, math.tau)
+            speed = random.uniform(1.8, 6.5) * (0.80 + intensity * 0.28)
+            _x = float(cx + random.randint(-5, 5))
+            _y = float(cy + random.randint(-5, 5))
+            blood_droplets.append({
+                'x': _x,
+                'y': _y,
+                'px': _x,
+                'py': _y,
+                'vx': math.cos(angle) * speed + bx,
+                'vy': math.sin(angle) * speed + by,
+                'life': random.randint(24, 52),
+                'max': 52,
+                'radius': random.randint(1, 3),
+                'color': random.choice(BLOOD_COLORS),
+            })
+        chunk_total = max(1, int(intensity * random.randint(1, 3)))
+        for _ in range(chunk_total):
+            _cw = random.randint(4, 10)
+            _ch = random.randint(3, 8)
+            blood_chunks.append({
+                'x': float(cx),
+                'y': float(cy),
+                'vx': random.uniform(-3.8, 3.8) + bx * 0.35,
+                'vy': random.uniform(-5.0, -1.2) + by * 0.25,
+                'life': random.randint(35, 68),
+                'max': 68,
+                'w': _cw,
+                'h': _ch,
+                'spin': random.uniform(-0.24, 0.24),
+                'angle': random.uniform(0.0, math.tau),
+                'color': random.choice(BLOOD_COLORS[:3]),
+            })
+        for _ in range(max(0, stains)):
+            _size = random.randint(10, 22)
+            _base_color = random.choice(BLOOD_COLORS[:3])
+            _dry_color = tuple(max(0, int(c * 0.68)) for c in _base_color)
+            blood_decals.append({
+                'x': int(cx + random.randint(-14, 14)),
+                'y': int(cy + random.randint(-10, 10)),
+                'w': _size,
+                'h': max(6, int(_size * random.uniform(0.55, 1.15))),
+                'life': int(random.randint(220, 420) * _decal_life_scale),
+                'max': int(420 * _decal_life_scale),
+                'wet': _wet_frames,
+                'wet_max': max(1, _wet_frames),
+                'gloss': _gloss_scale,
+                'color': _base_color,
+                'dry_color': _dry_color,
+            })
+        del blood_droplets[:-MAX_BLOOD_DROPLETS]
+        del blood_chunks[:-MAX_BLOOD_CHUNKS]
+        del blood_decals[:-MAX_BLOOD_DECALS]
+
     # ── High score (persistent, top 3) ────────────────────────────────────
-    hs_file_legacy = os.path.join(BASE_DIR, cfg.HIGH_SCORE_FILE_LEGACY)
-    hs_file_v2 = os.path.join(BASE_DIR, cfg.HIGH_SCORE_FILE_V2)
-    _lb_choice = str(getattr(cfg, 'HIGH_SCORE_LADDER', 'v2')).lower()
-    if _lb_choice == 'legacy':
-        hs_file = hs_file_legacy
-        leaderboard_label = 'LEGACY'
-    else:
-        hs_file = hs_file_v2
-        leaderboard_label = 'V2'
-    scores = [[0, cfg.HIGH_SCORE_DEFAULT_NAME] for _ in range(cfg.HIGH_SCORE_ENTRIES)]
-    try:
-        with open(hs_file) as _f:
-            _loaded = []
-            for _line in _f.read().strip().splitlines()[:cfg.HIGH_SCORE_ENTRIES]:
-                _p = _line.strip().split()
-                if not _p:
-                    continue
-                try:
-                    _loaded.append([int(_p[0]), _p[1][:3].upper() if len(_p) > 1 else cfg.HIGH_SCORE_DEFAULT_NAME])
-                except ValueError:
-                    print(f"Warning: skipping malformed high score row: {_line!r}")
-            scores = _normalize_scores(_loaded, cfg.HIGH_SCORE_ENTRIES, cfg.HIGH_SCORE_DEFAULT_NAME)
-    except Exception as err:
-        print(f"Warning: high score load failed: {err}")
-        scores = _normalize_scores(scores, cfg.HIGH_SCORE_ENTRIES, cfg.HIGH_SCORE_DEFAULT_NAME)
+    hs_file, leaderboard_label = resolve_score_file(
+        BASE_DIR,
+        str(getattr(cfg, 'HIGH_SCORE_LADDER', 'v2')),
+        cfg.HIGH_SCORE_FILE_LEGACY,
+        cfg.HIGH_SCORE_FILE_V2,
+    )
+    scores = load_scores(hs_file, cfg.HIGH_SCORE_ENTRIES, cfg.HIGH_SCORE_DEFAULT_NAME)
     high_score = scores[0][0]
     high_score_name = scores[0][1]
 
@@ -1786,8 +2397,29 @@ def main() -> None:
     while restart:
         restart = False
 
+        replay_events: List[str] = []
+        replay_log_path = build_replay_log_path(BASE_DIR)
+        append_replay_event(
+            replay_events,
+            0,
+            'run_start',
+            f'difficulty={_difficulty_key};max_continues={max_continues}',
+        )
+
         # Reset all game state each run
         sprite_rect        = sprite_image.get_rect(center=(WIDTH // 2, HEIGHT - 100))
+        # Player movement state
+        player_position = pygame.Vector2(sprite_rect.center)
+        player_velocity = pygame.Vector2(0.0, 0.0)
+        movement_boost = 0.0
+        movement_boost_timer = 0
+        # Enemy AI profiles
+        enemy_ai_profiles = {}
+        # Gore state
+        blood_droplets = []
+        blood_chunks = []
+        blood_decals = []
+        blood_fx_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         fireballs          = []
         enemies            = []
         enemy_bullets      = []
@@ -1796,20 +2428,22 @@ def main() -> None:
         fire_timer         = 0
         shoot_pose_timer   = 0
         score              = 0
-        health             = 6
+        health             = max(1, min(8, 6 + player_health_bonus))
         block_signal       = 100
         block_signal_max   = 100
         signal_meter       = 0
         signal_max         = 100
         signal_burst_flash = 0
+        signal_burst_ring_timer = 0
+        signal_burst_center = (WIDTH // 2, HEIGHT // 2)
 
         current_background_img = background_img_level_1
         boss_image         = boss_image_level_1
         boss_active        = False
         boss_warned        = False
         boss_defeated      = False
-        boss_health        = 105
-        boss_max_health    = 105
+        boss_health        = _scaled_boss_health(105)
+        boss_max_health    = _scaled_boss_health(105)
         boss_speed         = 1
         boss_fire_interval = 52
         boss_fire_timer    = 0
@@ -1850,6 +2484,9 @@ def main() -> None:
         level_intro_timer  = 0
         game_over          = False
         game_won           = False
+        ancestral_protection_charges = 0
+        pending_level_four_intro = False
+        level4_scene_played = False
         continues_used     = 0
         running            = True
         continue_timer     = 0
@@ -1868,6 +2505,22 @@ def main() -> None:
         streak_msg_timer   = 0
         streak_text        = ''
         streak_color       = (255, 255, 255)
+        # ── PHASE 1: Run and Wave Tracking ───────────────────────────────
+        run_stats = {
+            'total_enemies_killed': 0,
+            'total_damage_taken': 0,
+            'total_enemies_escaped': 0,
+            'total_near_misses': 0,
+            'total_signal_bursts': 0,
+            'total_bosses_defeated': 0,
+        }
+        wave_stats = {
+            'wave_kills': 0,
+            'wave_damage_taken': 0,
+            'wave_enemies_escaped': 0,
+            'wave_near_misses': 0,
+            'wave_signal_bursts': 0,
+        }
         paused             = False
         beat_pulse            = 0
         swarm_active          = False
@@ -1879,6 +2532,7 @@ def main() -> None:
         boss_death_spiral     = False
         boss_spiral_angle     = 0.0
         trauma_mode           = False
+        level4_drone_timer    = 0
         dive_timer            = random.randint(
             WAVE_DIVE_COOLDOWN_MIN[wave - 1], WAVE_DIVE_COOLDOWN_MAX[wave - 1]
         )   # Galaga dive countdown
@@ -1890,13 +2544,34 @@ def main() -> None:
             return max(0, min(wave, 5) - 1)
 
         def _enemy_speed_mult() -> float:
-            return LEVEL_2_SPEED_MULT_CURVE[_level2_curve_idx()] if level >= 2 else 1.0
+            if level >= 4:
+                return LEVEL_4_SPEED_MULT_CURVE[_level2_curve_idx()] * enemy_speed_scale
+            elif level >= 3:
+                return LEVEL_3_SPEED_MULT_CURVE[_level2_curve_idx()] * enemy_speed_scale
+            elif level >= 2:
+                return LEVEL_2_SPEED_MULT_CURVE[_level2_curve_idx()] * enemy_speed_scale
+            else:
+                return enemy_speed_scale
 
         def _spawn_interval_mult() -> float:
-            return LEVEL_2_INTERVAL_MULT_CURVE[_level2_curve_idx()] if level >= 2 else 1.0
+            if level >= 4:
+                return LEVEL_4_INTERVAL_MULT_CURVE[_level2_curve_idx()] * spawn_interval_scale
+            elif level >= 3:
+                return LEVEL_3_INTERVAL_MULT_CURVE[_level2_curve_idx()] * spawn_interval_scale
+            elif level >= 2:
+                return LEVEL_2_INTERVAL_MULT_CURVE[_level2_curve_idx()] * spawn_interval_scale
+            else:
+                return spawn_interval_scale
 
         def _bullet_speed_value() -> float:
-            return BULLET_SPEED + (LEVEL_2_BULLET_BONUS_CURVE[_level2_curve_idx()] if level >= 2 else 0.0)
+            if level >= 4:
+                return (BULLET_SPEED + LEVEL_4_BULLET_BONUS_CURVE[_level2_curve_idx()]) * enemy_speed_scale
+            elif level >= 3:
+                return (BULLET_SPEED + LEVEL_3_BULLET_BONUS_CURVE[_level2_curve_idx()]) * enemy_speed_scale
+            elif level >= 2:
+                return (BULLET_SPEED + LEVEL_2_BULLET_BONUS_CURVE[_level2_curve_idx()]) * enemy_speed_scale
+            else:
+                return BULLET_SPEED * enemy_speed_scale
 
         def _boss_burst_particles(cx, cy):
             return [
@@ -1917,15 +2592,66 @@ def main() -> None:
                 for _ in range(40)
             ]
 
+        def _signal_burst_particles(cx, cy):
+            _count = 20 if PHOTOSENSITIVE_SAFE_MODE else 36
+            _speed = 4.0 if PHOTOSENSITIVE_SAFE_MODE else 6.2
+            _colors = [
+                (255, 240, 120),
+                (255, 170, 80),
+                (255, 255, 255),
+                (130, 230, 255),
+            ]
+            spawned = []
+            for _ in range(_count):
+                ang = random.uniform(0.0, math.tau)
+                spd = random.uniform(_speed * 0.55, _speed)
+                spawned.append(Particle(
+                    x=float(cx),
+                    y=float(cy),
+                    vx=math.cos(ang) * spd,
+                    vy=math.sin(ang) * spd,
+                    life=random.randint(14, 22 if PHOTOSENSITIVE_SAFE_MODE else 28),
+                    max=28,
+                    color=random.choice(_colors),
+                ))
+            return spawned
+
+        def _reset_wave_stats():
+            nonlocal wave_stats
+            wave_stats = {
+                'wave_kills': 0,
+                'wave_damage_taken': 0,
+                'wave_enemies_escaped': 0,
+                'wave_near_misses': 0,
+                'wave_signal_bursts': 0,
+            }
+
         def _defeat_boss():
-            nonlocal boss_active, boss_defeated, score, boss_defeat_timer
+            nonlocal boss_active, boss_defeated, score, boss_defeat_timer, pending_level_four_intro
+            nonlocal run_stats
             if boss_defeated:
                 return
             boss_active = False
             boss_defeated = True
+            run_stats['total_bosses_defeated'] += 1
+            append_replay_event(replay_events, frame_count, 'boss_defeated', f'level={level};wave={wave}')
             score += int(2000 * WAVE_MULT[wave - 1])
+            if level == 3:
+                pending_level_four_intro = True
             particles.extend(_boss_burst_particles(boss_rect.centerx, boss_rect.centery))
+            # Massive gore burst on boss death
+            _spawn_blood_burst(
+                boss_rect.centerx,
+                boss_rect.centery,
+                intensity=3.0,
+                bias=(0.0, -0.5),
+                stains=5,
+                wet_frames=260,
+                gloss_scale=1.6,
+                decal_life_scale=1.45,
+            )
             enemies.clear()
+            enemy_ai_profiles.clear()
             enemy_bullets.clear()
             aimed_bullets.clear()
             boss_bullets.clear()
@@ -1943,6 +2669,7 @@ def main() -> None:
             nonlocal signal_meter, particles, swarm_active, swarm_timer, swarm_msg_timer
             nonlocal next_event_frame, near_miss_ids, chroma_timer, boss_death_spiral
             nonlocal boss_spiral_angle, trauma_mode, dive_timer, current_background_img, boss_image
+            nonlocal level4_drone_timer, wave_stats
             nonlocal current_bgm_tag
 
             # Hard reset into Level 2 so no Level 1 transient state leaks forward.
@@ -1952,6 +2679,7 @@ def main() -> None:
             wave = 1
             wave_spawned = 0
             wave_kills = 0
+            _reset_wave_stats()
             wave_transition_timer = 0
             # Avoid stacked banner clutter right after the Level 2 cinematic.
             wave_intro_timer = 0
@@ -1972,8 +2700,8 @@ def main() -> None:
             boss_defeated = False
             boss_defeat_timer = 0
             boss_active = False
-            boss_health = 140
-            boss_max_health = 140
+            boss_max_health = _scaled_boss_health(140)
+            boss_health = boss_max_health
             boss_fire_interval = 44
             boss_fire_timer = 0
             boss_critical = False
@@ -1989,6 +2717,7 @@ def main() -> None:
             boss_spiral_angle = 0.0
 
             enemies.clear()
+            enemy_ai_profiles.clear()
             side_bullets.clear()
             enemy_bullets.clear()
             aimed_bullets.clear()
@@ -2008,6 +2737,7 @@ def main() -> None:
             shake_timer = max(shake_timer, 0 if PHOTOSENSITIVE_SAFE_MODE else 24)
             chroma_timer = max(chroma_timer, 0 if PHOTOSENSITIVE_SAFE_MODE else 18)
             signal_meter = min(signal_max, signal_meter + 20)
+            level4_drone_timer = 0
 
             score_popups.append(ScorePopup(
                 x=WIDTH // 2,
@@ -2017,6 +2747,192 @@ def main() -> None:
                 text='LEVEL 2  TRAUMA MODE',
                 color=(255, 90, 90),
             ))
+            append_replay_event(replay_events, frame_count, 'level_start', 'level=2')
+
+        def _start_level_three():
+            nonlocal level, wave, wave_spawned, wave_kills, wave_transition_timer, wave_intro_timer
+            nonlocal level_intro_timer, sativa_dropped, boss_warned, boss_defeated, boss_defeat_timer
+            nonlocal boss_active, boss_health, boss_max_health, boss_fire_interval, boss_fire_timer
+            nonlocal boss_critical, boss_volley_count, boss_rect, boss_dir, boss_raging
+            nonlocal boss_minions, boss_minion_timer, boss_minion_interval, boss_warning_timer
+            nonlocal boss_rage_flash, aimed_bullets, enemy_bullets, boss_bullets, enemies
+            nonlocal side_bullets, health_pickups, sativa_pickups, data_souls, shake_timer
+            nonlocal signal_meter, particles, swarm_active, swarm_timer, swarm_msg_timer
+            nonlocal next_event_frame, near_miss_ids, chroma_timer, boss_death_spiral
+            nonlocal boss_spiral_angle, trauma_mode, dive_timer, current_background_img, boss_image
+            nonlocal level4_drone_timer, wave_stats
+            nonlocal current_bgm_tag
+
+            # Hard reset into Level 3 — apex difficulty
+            level = 3
+            current_background_img = background_img_level_3
+            boss_image = boss_image_level_3
+            wave = 1
+            wave_spawned = 0
+            wave_kills = 0
+            _reset_wave_stats()
+            wave_transition_timer = 0
+            wave_intro_timer = 0
+            level_intro_timer = 180
+            sativa_dropped = False
+            trauma_mode = True
+
+            if level3_music_file and current_bgm_tag != "level3":
+                try:
+                    pygame.mixer.music.load(level3_music_file)
+                    pygame.mixer.music.set_volume(cfg.VOLUME_MUSIC)
+                    pygame.mixer.music.play(-1)
+                    current_bgm_tag = "level3"
+                except pygame.error as err:
+                    print(f"⚠️ Level 3 music failed: {err}")
+
+            boss_warned = False
+            boss_defeated = False
+            boss_defeat_timer = 0
+            boss_active = False
+            boss_max_health = _scaled_boss_health(180)
+            boss_health = boss_max_health
+            boss_fire_interval = 40
+            boss_fire_timer = 0
+            boss_critical = False
+            boss_volley_count = 0
+            boss_rect = boss_image.get_rect(center=(WIDTH // 2, -100))
+            boss_dir = 1
+            boss_raging = False
+            boss_minion_timer = 0
+            boss_minion_interval = 80
+            boss_warning_timer = 0
+            boss_rage_flash = 0
+            boss_death_spiral = False
+            boss_spiral_angle = 0.0
+
+            enemies.clear()
+            enemy_ai_profiles.clear()
+            side_bullets.clear()
+            enemy_bullets.clear()
+            aimed_bullets.clear()
+            boss_bullets.clear()
+            boss_minions.clear()
+            health_pickups.clear()
+            sativa_pickups.clear()
+            data_souls.clear()
+            particles.clear()
+            near_miss_ids.clear()
+
+            swarm_active = False
+            swarm_timer = 0
+            swarm_msg_timer = 0
+            next_event_frame = frame_count + random.randint(200, 340)
+            dive_timer = random.randint(WAVE_DIVE_COOLDOWN_MIN[0], WAVE_DIVE_COOLDOWN_MAX[0])
+            shake_timer = max(shake_timer, 0 if PHOTOSENSITIVE_SAFE_MODE else 24)
+            chroma_timer = max(chroma_timer, 0 if PHOTOSENSITIVE_SAFE_MODE else 18)
+            signal_meter = min(signal_max, signal_meter + 25)
+            level4_drone_timer = 0
+
+            score_popups.append(ScorePopup(
+                x=WIDTH // 2,
+                y=HEIGHT // 2 - 70,
+                timer=135,
+                max=135,
+                text='LEVEL 3  APEX MODE',
+                color=(255, 180, 0),
+            ))
+            append_replay_event(replay_events, frame_count, 'level_start', 'level=3')
+
+        def _start_level_four():
+            nonlocal level, wave, wave_spawned, wave_kills, wave_transition_timer, wave_intro_timer
+            nonlocal level_intro_timer, sativa_dropped, boss_warned, boss_defeated, boss_defeat_timer
+            nonlocal boss_active, boss_health, boss_max_health, boss_fire_interval, boss_fire_timer
+            nonlocal boss_critical, boss_volley_count, boss_rect, boss_dir, boss_raging
+            nonlocal boss_minions, boss_minion_timer, boss_minion_interval, boss_warning_timer
+            nonlocal boss_rage_flash, aimed_bullets, enemy_bullets, boss_bullets, enemies
+            nonlocal side_bullets, health_pickups, sativa_pickups, data_souls, shake_timer
+            nonlocal signal_meter, particles, swarm_active, swarm_timer, swarm_msg_timer
+            nonlocal next_event_frame, near_miss_ids, chroma_timer, boss_death_spiral
+            nonlocal boss_spiral_angle, trauma_mode, dive_timer, current_background_img, boss_image
+            nonlocal level4_drone_timer, wave_stats
+            nonlocal current_bgm_tag, ancestral_protection_charges, pending_level_four_intro, level4_scene_played
+
+            level = 4
+            current_background_img = background_img_level_4
+            boss_image = boss_image_level_4
+            wave = 1
+            wave_spawned = 0
+            wave_kills = 0
+            _reset_wave_stats()
+            wave_transition_timer = 0
+            wave_intro_timer = 0
+            level_intro_timer = 200
+            sativa_dropped = False
+            trauma_mode = True
+            ancestral_protection_charges = max(ancestral_protection_charges, 3)
+            pending_level_four_intro = False
+            level4_scene_played = True
+
+            _l4_music = level4_music_file or level3_music_file or level2_music_file or music_file
+            if _l4_music and current_bgm_tag != "level4":
+                try:
+                    pygame.mixer.music.load(_l4_music)
+                    pygame.mixer.music.set_volume(cfg.VOLUME_MUSIC)
+                    pygame.mixer.music.play(-1)
+                    current_bgm_tag = "level4"
+                except pygame.error as err:
+                    print(f"⚠️ Level 4 music failed: {err}")
+
+            boss_warned = False
+            boss_defeated = False
+            boss_defeat_timer = 0
+            boss_active = False
+            boss_max_health = _scaled_boss_health(230)
+            boss_health = boss_max_health
+            boss_fire_interval = 34
+            boss_fire_timer = 0
+            boss_critical = False
+            boss_volley_count = 0
+            boss_rect = boss_image.get_rect(center=(WIDTH // 2, -100))
+            boss_dir = 1
+            boss_raging = False
+            boss_minion_timer = 0
+            boss_minion_interval = 64
+            boss_warning_timer = 0
+            boss_rage_flash = 0
+            boss_death_spiral = False
+            boss_spiral_angle = 0.0
+
+            enemies.clear()
+            enemy_ai_profiles.clear()
+            side_bullets.clear()
+            enemy_bullets.clear()
+            aimed_bullets.clear()
+            boss_bullets.clear()
+            boss_minions.clear()
+            health_pickups.clear()
+            sativa_pickups.clear()
+            data_souls.clear()
+            particles.clear()
+            near_miss_ids.clear()
+            for _ in range(4):
+                _spawn_enemy(random.randint(0, WIDTH - 40), random.randint(-220, -40))
+
+            swarm_active = False
+            swarm_timer = 0
+            swarm_msg_timer = 0
+            next_event_frame = frame_count + random.randint(180, 300)
+            dive_timer = random.randint(WAVE_DIVE_COOLDOWN_MIN[0], WAVE_DIVE_COOLDOWN_MAX[0])
+            shake_timer = max(shake_timer, 0 if PHOTOSENSITIVE_SAFE_MODE else 20)
+            chroma_timer = max(chroma_timer, 0 if PHOTOSENSITIVE_SAFE_MODE else 16)
+            signal_meter = min(signal_max, signal_meter + 35)
+            level4_drone_timer = random.randint(36, 64)
+
+            score_popups.append(ScorePopup(
+                x=WIDTH // 2,
+                y=HEIGHT // 2 - 50,
+                timer=130,
+                max=130,
+                text='ANCESTRAL PROTECTION +3',
+                color=(255, 245, 170),
+            ))
+            append_replay_event(replay_events, frame_count, 'level_start', 'level=4')
 
         def _damage_boss(amount, grant_signal=True):
             nonlocal boss_health, signal_meter
@@ -2031,13 +2947,51 @@ def main() -> None:
         def _damage_player():
             nonlocal health, shake_timer, hit_flash_timer, chroma_timer
             nonlocal iframe_timer, game_over, continue_timer
+            nonlocal ancestral_protection_charges, run_stats, wave_stats
             if iframe_timer != 0:
                 return
+            if ancestral_protection_charges > 0:
+                ancestral_protection_charges -= 1
+                iframe_timer = 30
+                shake_timer = max(shake_timer, 4)
+                hit_flash_timer = max(hit_flash_timer, 3)
+                score_popups.append(ScorePopup(
+                    x=sprite_rect.centerx,
+                    y=sprite_rect.top - 24,
+                    timer=50,
+                    max=50,
+                    text='ANCESTRAL GUARD',
+                    color=(170, 255, 220),
+                ))
+                for _ in range(12):
+                    _ang = random.uniform(0.0, math.tau)
+                    particles.append(Particle(
+                        x=float(sprite_rect.centerx),
+                        y=float(sprite_rect.centery),
+                        vx=math.cos(_ang) * random.uniform(1.5, 3.0),
+                        vy=math.sin(_ang) * random.uniform(1.5, 3.0),
+                        life=random.randint(10, 16),
+                        max=16,
+                        color=(170, 255, 220),
+                    ))
+                if signal_burst_sound:
+                    burst_channel.play(signal_burst_sound)
+                return
             health -= 1
+            run_stats['total_damage_taken'] += 1
+            wave_stats['wave_damage_taken'] += 1
             shake_timer = 10
             hit_flash_timer = 8
             chroma_timer = 12
             iframe_timer = IFRAME_DURATION
+            # Gore on player hit
+            _spawn_blood_burst(
+                sprite_rect.centerx,
+                sprite_rect.centery,
+                intensity=0.8,
+                bias=(random.uniform(-0.5, 0.5), -0.8),
+                stains=1,
+            )
             if impact_sound:
                 impact_channel.play(impact_sound)
             if health <= 0:
@@ -2059,7 +3013,10 @@ def main() -> None:
         def _register_enemy_destroyed(enemy, popup_color, particle_colors, particle_count):
             nonlocal wave_kills, combo, combo_timer, score, signal_meter
             nonlocal streak_count, streak_timer, streak_text, streak_color, streak_msg_timer
+            nonlocal run_stats, wave_stats, movement_boost, movement_boost_timer
             wave_kills += 1
+            run_stats['total_enemies_killed'] += 1
+            wave_stats['wave_kills'] += 1
             cx, cy = enemy[0].centerx, enemy[0].centery
             combo += 1
             combo_timer = 120
@@ -2076,6 +3033,27 @@ def main() -> None:
                 streak_text = 'QUAD KILL!';   streak_color = (255,  80,  80); streak_msg_timer = 75
             elif streak_count >= 5:
                 streak_text = 'RAMPAGE!';     streak_color = (200,   0, 255); streak_msg_timer = 90
+            # Kill boost: reward skill with temporary speed
+            movement_boost = min(
+                PLAYER_BOOST_MAX,
+                movement_boost + PLAYER_KILL_BOOST_AMOUNT,
+            )
+            movement_boost_timer = PLAYER_KILL_BOOST_FRAMES
+            # Trigger gore on kill
+            _profile = enemy_ai_profiles.get(id(enemy), {})
+            _role = _profile.get('role', 'drifter')
+            _is_elite = bool(enemy[2]) or _role in ('hunter', 'gunner')
+            gore_force = 1.75 if _is_elite else 0.95
+            _spawn_blood_burst(
+                cx,
+                cy,
+                intensity=gore_force,
+                bias=(random.uniform(-0.8, 0.8), 0.6),
+                stains=3 if _is_elite else 1,
+                wet_frames=190 if _is_elite else BLOOD_WET_FRAMES,
+                gloss_scale=1.3 if _is_elite else 0.95,
+                decal_life_scale=1.22 if _is_elite else 0.9,
+            )
             score_popups.append(ScorePopup(
                 x=cx,
                 y=enemy[0].top,
@@ -2106,6 +3084,8 @@ def main() -> None:
             _minion_pts = int(150 * WAVE_MULT[wave - 1])
             score += _minion_pts
             signal_meter = min(signal_max, signal_meter + 4)
+            # Trigger gore on minion kill
+            _spawn_blood_burst(cx, cy, intensity=1.25, stains=1)
             score_popups.append(ScorePopup(
                 x=cx,
                 y=minion['rect'].top,
@@ -2146,13 +3126,14 @@ def main() -> None:
                     pygame.quit()
                     sys.exit()
                 if continue_timer > 0 and event.type == pygame.KEYDOWN:
-                    if event.key in (pygame.K_SPACE, pygame.K_RETURN) and continues_used < 2:
+                    if event.key in (pygame.K_SPACE, pygame.K_RETURN) and continues_used < max_continues:
                         continues_used += 1
-                        health = 3
+                        health = max(1, min(8, 3 + max(0, player_health_bonus)))
                         game_over = False
                         continue_timer = 0
                         iframe_timer = 180
-                    elif continues_used >= 2:
+                        append_replay_event(replay_events, frame_count, 'continue_used', f'count={continues_used}')
+                    elif continues_used >= max_continues:
                         running = False
                         continue_timer = 0
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE \
@@ -2161,20 +3142,31 @@ def main() -> None:
                 if (event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT
                         and signal_meter >= signal_max and not show_upgrade
                         and continue_timer == 0 and not paused):
+                    signal_burst_center = sprite_rect.center
                     enemy_bullets.clear()
                     aimed_bullets.clear()
                     boss_bullets.clear()
                     burst_points = len(enemies) * 100 + len(boss_minions) * 150
+                    run_stats['total_signal_bursts'] += 1
+                    wave_stats['wave_signal_bursts'] += 1
                     if boss_active and not boss_defeated:
                         boss_health = max(0, boss_health - 10)
                         if boss_health <= 0:
                             _defeat_boss()
                     enemies.clear()
+                    enemy_ai_profiles.clear()
                     boss_minions.clear()
                     score += burst_points
                     signal_meter = 0
-                    signal_burst_flash = 24
-                    shake_timer = max(shake_timer, 18)
+                    signal_burst_flash = 18 if PHOTOSENSITIVE_SAFE_MODE else 28
+                    signal_burst_ring_timer = 18 if PHOTOSENSITIVE_SAFE_MODE else 24
+                    shake_timer = max(shake_timer, 8 if PHOTOSENSITIVE_SAFE_MODE else 20)
+                    chroma_timer = max(chroma_timer, 0 if PHOTOSENSITIVE_SAFE_MODE else 10)
+                    particles.extend(_signal_burst_particles(*signal_burst_center))
+                    if signal_burst_sound:
+                        burst_channel.play(signal_burst_sound)
+                    elif impact_sound:
+                        impact_channel.play(impact_sound)
                     score_popups.append(ScorePopup(
                         x=WIDTH // 2,
                         y=HEIGHT // 2 - 90,
@@ -2183,6 +3175,7 @@ def main() -> None:
                         text=f'SIGNAL BURST! +{burst_points}',
                         color=(255, 220, 60),
                     ))
+                    append_replay_event(replay_events, frame_count, 'signal_burst', f'points={burst_points}')
                 if show_upgrade:
                     _uidx = -1
                     if event.type == pygame.KEYDOWN:
@@ -2207,6 +3200,7 @@ def main() -> None:
                         elif _pid == 'power_shot':  perk_power_shot = True
                         elif _pid == 'lucky_drop':  perk_lucky_drop = True
                         show_upgrade = False
+                        _reset_wave_stats()
                         wave += 1
                         wave_spawned = 0
                         wave_kills   = 0
@@ -2216,7 +3210,7 @@ def main() -> None:
             if game_over and continue_timer > 0:
                 frame_count += 1
                 continue_timer -= 1
-                if continues_used < 2:
+                if continues_used < max_continues:
                     # ── CONTINUE? screen ─────────────────────────────────
                     _cd_secs = max(0, continue_timer // 60)
                     screen.blit(_cont_ov, (0, 0))
@@ -2225,7 +3219,7 @@ def main() -> None:
                     _cn_col = (255, 60, 60) if _cd_secs <= 3 else (255, 200, 60)
                     _cn = font_huge.render(str(_cd_secs), True, _cn_col)
                     screen.blit(_cn, _cn.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 15)))
-                    _rem = 2 - continues_used
+                    _rem = max_continues - continues_used
                     _crem = font_med.render(
                         f'{_rem}  CONTINUE{"S" if _rem != 1 else ""}  REMAINING',
                         True, (180, 80, 255))
@@ -2273,20 +3267,51 @@ def main() -> None:
 
             if not show_upgrade:
                 keys = pygame.key.get_pressed()
-                _spd  = perk_speed + (2 if beat_pulse > BEAT_PULSE_FRAMES - 4 else 0) + (4 if sativa_active else 0)
-                _dspd = int(_spd * dt_mul)
-                if keys[pygame.K_LEFT]  and sprite_rect.left   > 0:     sprite_rect.x -= _dspd
-                if keys[pygame.K_RIGHT] and sprite_rect.right  < WIDTH:  sprite_rect.x += _dspd
-                if keys[pygame.K_UP]    and sprite_rect.top    > 0:      sprite_rect.y -= _dspd
-                if keys[pygame.K_DOWN]  and sprite_rect.bottom < HEIGHT: sprite_rect.y += _dspd
+                move_input = pygame.Vector2(
+                    int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT]),
+                    int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP]),
+                )
+                # Prevent diagonal turbo speed.
+                if move_input.length_squared() > 1.0:
+                    move_input = move_input.normalize()
+                # Controlled boosts: strong enough to feel, never enough to break dodging.
+                if movement_boost_timer > 0:
+                    movement_boost_timer -= 1
+                else:
+                    movement_boost = max(0.0, movement_boost - 0.04 * dt_mul)
+                base_speed = min(PLAYER_MAX_NORMAL_SPEED, float(perk_speed))
+                beat_bonus = 0.75 if beat_pulse > BEAT_PULSE_FRAMES - 4 else 0.0
+                sativa_bonus = 2.0 if sativa_active else 0.0
+                max_speed = min(
+                    PLAYER_MAX_POWER_SPEED,
+                    base_speed + beat_bonus + sativa_bonus + movement_boost,
+                )
+                target_velocity = move_input * max_speed
+                # Turning should feel sharper than simply accelerating from rest.
+                turning = (
+                    move_input.length_squared() > 0
+                    and player_velocity.length_squared() > 0
+                    and player_velocity.dot(target_velocity) < 0
+                )
+                accel = PLAYER_ACCELERATION * (PLAYER_TURN_ACCEL_MULT if turning else 1.0)
+                rate = accel if move_input.length_squared() > 0 else PLAYER_DECELERATION
+                player_velocity = _approach_vector(
+                    player_velocity,
+                    target_velocity,
+                    rate * dt_mul,
+                )
+                player_position += player_velocity * dt_mul
+                sprite_rect.center = (round(player_position.x), round(player_position.y))
                 sprite_rect.clamp_ip(screen_bounds)
-                if any(keys[k] for k in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN)):
+                player_position.update(sprite_rect.center)
+                # Keep the existing trail, but tie it to actual velocity.
+                if player_velocity.length_squared() > 0.55:
                     for _ in range(2):
                         particles.append(Particle(
                             x=float(sprite_rect.centerx + random.randint(-6, 6)),
                             y=float(sprite_rect.bottom - 4),
-                            vx=random.uniform(-0.4, 0.4),
-                            vy=random.uniform(1.5, 3.5),
+                            vx=random.uniform(-0.4, 0.4) - player_velocity.x * 0.05,
+                            vy=random.uniform(1.5, 3.5) - player_velocity.y * 0.05,
                             life=random.randint(8, 18),
                             max=18,
                             color=random.choice([(0,150,255),(50,200,255),(100,230,255)]),
@@ -2403,8 +3428,13 @@ def main() -> None:
                             and not (p['id'] == 'speed_boost' and perk_speed >= 8)
                         ]
                         upgrade_choices = random.sample(_perk_pool, k=min(3, len(_perk_pool)))
+                if (pending_level_four_intro and (not level4_scene_played) and level == 3 and boss_defeated
+                    and boss_defeat_timer <= 0 and not boss_active):
+                    _level_four_transition(screen, clock, background_img_level_4)
+                    _start_level_four()
             elif (not boss_active and not boss_warned and not boss_defeated
                     and not show_upgrade
+                    and wave_transition_timer == 0
                     and wave_spawned >= WAVE_DEFS[wave - 1]['count']
                     and len(enemies) == 0):
                 _wave_bonus = 200 * wave  # scales: 200, 400, 600, 800, 1000
@@ -2425,12 +3455,20 @@ def main() -> None:
                 if wave_spawned < _eff_count:
                     enemy_timer += 1
                     if enemy_timer >= _eff_interval:
-                        enemies.append(Enemy(
-                            rect=pygame.Rect(random.randint(0, WIDTH - 40), 0, 40, 40),
-                            angle=random.uniform(0, 2 * math.pi),
-                        ))
+                        _spawn_enemy(random.randint(0, WIDTH - 40), 0)
                         enemy_timer = 0
                         wave_spawned += 1
+
+                if level >= 4 and wave_spawned < _eff_count:
+                    level4_drone_timer -= 1
+                    if level4_drone_timer <= 0:
+                        _remaining = max(0, _eff_count - wave_spawned)
+                        _screen_cap = max(0, 16 - len(enemies))
+                        _pack = min(_remaining, _screen_cap, 1 + wave // 2)
+                        for _ in range(_pack):
+                            _spawn_enemy(random.randint(0, WIDTH - 40), random.randint(-120, -20))
+                            wave_spawned += 1
+                        level4_drone_timer = random.randint(max(22, 58 - 6 * wave), max(50, 92 - 8 * wave))
 
             # ── Galaga dive trigger ──────────────────────────────────────────
             dive_timer -= 1
@@ -2490,29 +3528,131 @@ def main() -> None:
                     e[0].x += int(_kdx / _kdist * _kspd * dt_mul)
                     e[0].y += int(_kdy / _kdist * _kspd * dt_mul)
                 elif e[3] is None:
-                    e[0].y += int(WAVE_ENEMY_SPEED[_wave_i] * _enemy_speed_mult() * dt_mul)
-                    _track_dx = sprite_rect.centerx - e[0].centerx
-                    _track_step = max(-WAVE_TRACK_CAP[_wave_i],
-                                      min(WAVE_TRACK_CAP[_wave_i], _track_dx * WAVE_TRACK_GAIN[_wave_i] * _enemy_speed_mult()))
-                    e[0].x = max(0, min(WIDTH - 40,
-                        e[0].x + int((math.sin(frame_count * 0.04 + e[1]) * 1.2 + _track_step) * dt_mul)))
-                    _shoot_prob = WAVE_SHOOT_PROB[_wave_i] * (1.18 if trauma_mode else 1.0)
-                    if random.random() < _shoot_prob:
-                        _bspd = _bullet_speed_value()
-                        if random.random() < WAVE_AIMED_SHOT_RATIO[_wave_i]:
-                            dx = sprite_rect.centerx - e[0].centerx
-                            dy = sprite_rect.centery - e[0].centery
-                            dist = math.hypot(dx, dy) or 1
-                            aimed_bullets.append({'x': float(e[0].centerx), 'y': float(e[0].bottom),
-                                                  'vx': dx / dist * _bspd,
-                                                  'vy': dy / dist * _bspd})
-                        else:
-                            enemy_bullets.append(pygame.Rect(e[0].centerx - 4, e[0].bottom, 8, 12))
+                    # Role-based AI movement system
+                    _profile = enemy_ai_profiles.get(id(e))
+                    if _profile is None:
+                        # Fallback for enemies without profile (shouldn't happen)
+                        e[0].y += int(WAVE_ENEMY_SPEED[_wave_i] * _enemy_speed_mult() * dt_mul)
+                    else:
+                        _role = _profile['role']
+                        _reaction_frames = NPC_REACTION_FRAMES.get(_role, 0)
+                        _profile['reaction_frames'] = max(0, _profile['reaction_frames'] - 1)
+                        
+                        if _role == 'drifter':
+                            # Sine-wave descent with horizontal wobble
+                            e[0].y += int(WAVE_ENEMY_SPEED[_wave_i] * _enemy_speed_mult() * dt_mul)
+                            _wobble = math.sin(frame_count * 0.04 + e[1]) * 1.8
+                            _track_dx = sprite_rect.centerx - e[0].centerx
+                            _track_step = max(-WAVE_TRACK_CAP[_wave_i],
+                                            min(WAVE_TRACK_CAP[_wave_i], _track_dx * WAVE_TRACK_GAIN[_wave_i] * 0.6))
+                            e[0].x = max(0, min(WIDTH - 40, e[0].x + int((_wobble + _track_step) * dt_mul)))
+                        
+                        elif _role == 'tracker':
+                            # Gentle pursuit with phase lag
+                            if _profile['reaction_frames'] <= 0:
+                                _dx = sprite_rect.centerx - e[0].centerx
+                                _dy = sprite_rect.centery - e[0].centery
+                                _dist = math.hypot(_dx, _dy) or 1
+                                _spd = WAVE_ENEMY_SPEED[_wave_i] * 1.15 * _enemy_speed_mult()
+                                _phase_lag = 0.7 + 0.3 * math.sin(_profile['phase'])
+                                e[0].x += int((_dx / _dist) * _spd * _phase_lag * dt_mul)
+                                e[0].y += int((_dy / _dist) * _spd * 0.8 * dt_mul)
+                                _profile['phase'] += 0.05
+                            else:
+                                e[0].y += int(WAVE_ENEMY_SPEED[_wave_i] * 0.6 * _enemy_speed_mult() * dt_mul)
+                        
+                        elif _role == 'flanker':
+                            # Offset pursuit to flank player
+                            if _profile['reaction_frames'] <= 0:
+                                _dx = sprite_rect.centerx - e[0].centerx
+                                _dy = sprite_rect.centery - e[0].centery
+                                _dist = math.hypot(_dx, _dy) or 1
+                                _flank_offset = _profile.get('flank_offset', 60)
+                                _strafe_dir = _profile.get('strafe_dir', 1)
+                                _target_x = sprite_rect.centerx + _flank_offset * _strafe_dir
+                                _target_y = sprite_rect.centery + 40
+                                _tdx = _target_x - e[0].centerx
+                                _tdy = _target_y - e[0].centery
+                                _tdist = math.hypot(_tdx, _tdy) or 1
+                                _spd = WAVE_ENEMY_SPEED[_wave_i] * 1.1 * _enemy_speed_mult()
+                                e[0].x += int((_tdx / _tdist) * _spd * dt_mul)
+                                e[0].y += int((_tdy / _tdist) * _spd * 0.75 * dt_mul)
+                                e[0].x = max(0, min(WIDTH - 40, e[0].x))
+                            else:
+                                e[0].y += int(WAVE_ENEMY_SPEED[_wave_i] * 0.5 * _enemy_speed_mult() * dt_mul)
+                        
+                        elif _role == 'gunner':
+                            # Stationary or slow moving, focuses on aimed fire
+                            e[0].y += int(WAVE_ENEMY_SPEED[_wave_i] * 0.4 * _enemy_speed_mult() * dt_mul)
+                            _track_dx = sprite_rect.centerx - e[0].centerx
+                            _track_step = max(-WAVE_TRACK_CAP[_wave_i] * 0.5,
+                                            min(WAVE_TRACK_CAP[_wave_i] * 0.5, _track_dx * WAVE_TRACK_GAIN[_wave_i] * 0.4))
+                            e[0].x = max(0, min(WIDTH - 40, e[0].x + int(_track_step * dt_mul)))
+                        
+                        elif _role == 'hunter':
+                            # Aggressive pursuit capped at 92% player speed
+                            if _profile['reaction_frames'] <= 0:
+                                _dx = sprite_rect.centerx - e[0].centerx
+                                _dy = sprite_rect.centery - e[0].centery
+                                _dist = math.hypot(_dx, _dy) or 1
+                                _base_spd = WAVE_ENEMY_SPEED[_wave_i] * 1.45 * _enemy_speed_mult()
+                                _max_spd = max(PLAYER_MAX_NORMAL_SPEED, float(perk_speed)) * MAX_HUNTER_SPEED_RATIO
+                                _hunt_spd = min(_max_spd, _base_spd)
+                                e[0].x += int((_dx / _dist) * _hunt_spd * dt_mul)
+                                e[0].y += int((_dy / _dist) * _hunt_spd * dt_mul)
+                                e[0].x = max(0, min(WIDTH - 40, e[0].x))
+                            else:
+                                e[0].y += int(WAVE_ENEMY_SPEED[_wave_i] * 0.7 * _enemy_speed_mult() * dt_mul)
+                        
+                        # Cooldown-based shooting (all roles)
+                        _profile['shot_cd'] = max(0, _profile['shot_cd'] - 1)
+                        if _profile['shot_cd'] <= 0:
+                            _shoot_prob = WAVE_SHOOT_PROB[_wave_i] * (1.18 if trauma_mode else 1.0) * shoot_prob_scale
+                            if random.random() < _shoot_prob:
+                                _dx = sprite_rect.centerx - e[0].centerx
+                                _dy = sprite_rect.centery - e[0].centery
+                                _dist = math.hypot(_dx, _dy) or 1
+                                _bspd = _bullet_speed_value()
+                                
+                                # Role-specific shooting patterns
+                                if _role == 'gunner':
+                                    # Gunner: always aimed fire
+                                    aimed_bullets.append({'x': float(e[0].centerx), 'y': float(e[0].bottom),
+                                                        'vx': _dx / _dist * _bspd,
+                                                        'vy': _dy / _dist * _bspd})
+                                else:
+                                    # Others: chance of aimed fire based on wave
+                                    if random.random() < WAVE_AIMED_SHOT_RATIO[_wave_i]:
+                                        aimed_bullets.append({'x': float(e[0].centerx), 'y': float(e[0].bottom),
+                                                            'vx': _dx / _dist * _bspd,
+                                                            'vy': _dy / _dist * _bspd})
+                                    else:
+                                        enemy_bullets.append(pygame.Rect(e[0].centerx - 4, e[0].bottom, 8, 12))
+                                
+                                # Set cooldown for next shot
+                                _role_cooldowns = ROLE_SHOT_COOLDOWNS.get(_role, (30, 60))
+                                _profile['shot_cd'] = random.randint(_role_cooldowns[0], _role_cooldowns[1])
+
+            # ── Enemy separation (prevent clumping) ───────────────────────────
+            for _i, _e1 in enumerate(enemies):
+                for _e2 in enemies[_i+1:]:
+                    _dx = _e2[0].centerx - _e1[0].centerx
+                    _dy = _e2[0].centery - _e1[0].centery
+                    _dist = math.hypot(_dx, _dy) or 1
+                    if _dist < NPC_SEPARATION_RADIUS:
+                        _push = NPC_SEPARATION_FORCE / (_dist + 0.1)
+                        _e1[0].x -= int((_dx / _dist) * _push * dt_mul)
+                        _e2[0].x += int((_dx / _dist) * _push * dt_mul)
+                        _e1[0].x = max(0, min(WIDTH - 40, _e1[0].x))
+                        _e2[0].x = max(0, min(WIDTH - 40, _e2[0].x))
+
             _escaped_count = 0
             _next_enemies = []
             for e in enemies:
                 if e[0].top >= HEIGHT:
                     _escaped_count += 1
+                    run_stats['total_enemies_escaped'] += 1
+                    wave_stats['wave_enemies_escaped'] += 1
                     continue
                 if e[0].bottom <= -60:
                     continue
@@ -2566,8 +3706,16 @@ def main() -> None:
                     if (math.hypot(_nmb.centerx - _pcx, _nmb.centery - _pcy) < 38
                             and not _nmb.colliderect(sprite_rect)):
                         near_miss_ids.add(id(_nmb))
+                        run_stats['total_near_misses'] += 1
+                        wave_stats['wave_near_misses'] += 1
                         score += 50
                         signal_meter = min(signal_max, signal_meter + 5)
+                        # Near-miss boost
+                        movement_boost = max(movement_boost, PLAYER_NEAR_MISS_BOOST)
+                        movement_boost_timer = max(
+                            movement_boost_timer,
+                            PLAYER_NEAR_MISS_FRAMES,
+                        )
                         score_popups.append(ScorePopup(
                             x=_nmb.centerx,
                             y=_nmb.top - 10,
@@ -2582,8 +3730,16 @@ def main() -> None:
                     if (math.hypot(_nmab['x'] - _pcx, _nmab['y'] - _pcy) < 38
                             and not _nmab_r.colliderect(sprite_rect)):
                         near_miss_ids.add(id(_nmab))
+                        run_stats['total_near_misses'] += 1
+                        wave_stats['wave_near_misses'] += 1
                         score += 50
                         signal_meter = min(signal_max, signal_meter + 5)
+                        # Near-miss boost
+                        movement_boost = max(movement_boost, PLAYER_NEAR_MISS_BOOST)
+                        movement_boost_timer = max(
+                            movement_boost_timer,
+                            PLAYER_NEAR_MISS_FRAMES,
+                        )
                         score_popups.append(ScorePopup(
                             x=int(_nmab['x']),
                             y=int(_nmab['y']) - 10,
@@ -2823,6 +3979,11 @@ def main() -> None:
                 else:
                     screen.blit(current_sprite_image, sprite_rect)
 
+            if ancestral_protection_charges > 0 and iframe_timer % 6 < 3:
+                _aura_rad = sprite_rect.width // 2 + 8 + (2 if not PHOTOSENSITIVE_SAFE_MODE else 0)
+                _aura_col = (140, 255, 210) if PHOTOSENSITIVE_SAFE_MODE else (190, 255, 230)
+                pygame.draw.circle(screen, _aura_col, sprite_rect.center, _aura_rad, 2)
+
             # Fireball color shifts with shot tier
             if sativa_active:
                 _fb_col = (0, 255, 150)
@@ -2841,7 +4002,12 @@ def main() -> None:
                 _sbc = (0, 220, 255) if not sativa_active else (0, 255, 180)
                 pygame.draw.rect(screen, _sbc, (int(sb['x']) - 8, int(sb['y']) - 4, 16, 8))
             for e in enemies:
-                _dimg = drone_images_level_2[id(e) % 3] if level >= 2 else drone_image
+                if level >= 4:
+                    _dimg = drone_images_level_4[id(e) % len(drone_images_level_4)]
+                elif level >= 2:
+                    _dimg = drone_images_level_2[id(e) % 3]
+                else:
+                    _dimg = drone_image
                 screen.blit(_dimg, e[0])
                 if e[2] and (not PHOTOSENSITIVE_SAFE_MODE) and frame_count % 8 < 4:
                     screen.blit(_kflash_surf, e[0])
@@ -2849,6 +4015,120 @@ def main() -> None:
                     screen.blit(_dflash_surf, e[0])
             for bm in boss_minions:
                 screen.blit(minion_image or drone_image, bm['rect'])
+
+            # ── Gore update & render ──────────────────────────────────────────
+            # Clear surface for this frame
+            blood_fx_surface.fill((0, 0, 0, 0))
+            
+            # Render persistent decals (stays longest)
+            _next_decals = []
+            for decal in blood_decals:
+                decal['life'] -= 1
+                decal['wet'] = max(0, decal['wet'] - 1)
+                if decal['life'] > 0:
+                    # Fade out alpha
+                    _alpha = int(180 * decal['life'] / decal['max'])
+                    if _alpha > 0:
+                        _wet_mix = decal['wet'] / max(1, decal.get('wet_max', BLOOD_WET_FRAMES))
+                        _gloss = decal.get('gloss', 1.0)
+                        _base_col = decal['color']
+                        _dry_col = decal['dry_color']
+                        _blend_col = (
+                            int(_base_col[0] * _wet_mix + _dry_col[0] * (1.0 - _wet_mix)),
+                            int(_base_col[1] * _wet_mix + _dry_col[1] * (1.0 - _wet_mix)),
+                            int(_base_col[2] * _wet_mix + _dry_col[2] * (1.0 - _wet_mix)),
+                            _alpha,
+                        )
+                        pygame.draw.ellipse(
+                            blood_fx_surface,
+                            _blend_col,
+                            (decal['x'], decal['y'], decal['w'], decal['h']),
+                        )
+                        # Fresh blood catches a tiny highlight before drying.
+                        if decal['wet'] > 0 and _alpha > 40:
+                            _hx = decal['x'] + max(1, decal['w'] // 4)
+                            _hy = decal['y'] + max(1, decal['h'] // 4)
+                            _hr = max(1, int((min(decal['w'], decal['h']) // 6) * _gloss))
+                            pygame.draw.circle(
+                                blood_fx_surface,
+                                (255, 210, 210, min(92, int((_alpha // 3) * _gloss))),
+                                (_hx, _hy),
+                                _hr,
+                            )
+                    _next_decals.append(decal)
+            blood_decals = _next_decals
+            
+            # Update and render droplets (fast moving, short lived)
+            _next_drops = []
+            for droplet in blood_droplets:
+                droplet['px'] = droplet['x']
+                droplet['py'] = droplet['y']
+                droplet['vx'] *= BLOOD_DRAG
+                droplet['vy'] *= BLOOD_DRAG
+                droplet['vy'] += BLOOD_GRAVITY
+                droplet['x'] += droplet['vx']
+                droplet['y'] += droplet['vy']
+                droplet['life'] -= 1
+                if droplet['life'] > 0 and 0 <= droplet['x'] < WIDTH and 0 <= droplet['y'] < HEIGHT:
+                    # Fade out
+                    _alpha = int(200 * droplet['life'] / droplet['max'])
+                    if _alpha > 0:
+                        _drop_col = droplet['color'] + (_alpha,) if len(droplet['color']) == 3 else droplet['color']
+                        _trail_alpha = min(_alpha, BLOOD_TRAIL_ALPHA)
+                        _trail_col = droplet['color'] + (_trail_alpha,)
+                        pygame.draw.line(
+                            blood_fx_surface,
+                            _trail_col,
+                            (int(droplet['px']), int(droplet['py'])),
+                            (int(droplet['x']), int(droplet['y'])),
+                            1,
+                        )
+                        pygame.draw.circle(blood_fx_surface, _drop_col,
+                                         (int(droplet['x']), int(droplet['y'])), droplet['radius'])
+                    _next_drops.append(droplet)
+                elif droplet['life'] <= 0 and random.random() < BLOOD_POOL_CHANCE:
+                    _pw = random.randint(5, 11)
+                    _ph = random.randint(3, 8)
+                    _pool_color = random.choice(BLOOD_COLORS[:3])
+                    blood_decals.append({
+                        'x': int(droplet['x']) - _pw // 2,
+                        'y': int(droplet['y']) - _ph // 2,
+                        'w': _pw,
+                        'h': _ph,
+                        'life': random.randint(160, 280),
+                        'max': 280,
+                        'wet': max(24, BLOOD_WET_FRAMES // 3),
+                        'color': _pool_color,
+                        'dry_color': tuple(max(0, int(c * 0.65)) for c in _pool_color),
+                    })
+            blood_droplets = _next_drops
+            
+            # Update and render chunks (medium sized, medium lived)
+            _next_chunks = []
+            for chunk in blood_chunks:
+                chunk['vx'] *= BLOOD_DRAG
+                chunk['vy'] *= BLOOD_DRAG
+                chunk['vy'] += BLOOD_GRAVITY
+                chunk['x'] += chunk['vx']
+                chunk['y'] += chunk['vy']
+                chunk['life'] -= 1
+                if chunk['life'] > 0 and 0 <= chunk['x'] < WIDTH - chunk['w'] and 0 <= chunk['y'] < HEIGHT - chunk['h']:
+                    _alpha = int(220 * chunk['life'] / chunk['max'])
+                    if _alpha > 0:
+                        _chunk_col = chunk['color'] + (_alpha,) if len(chunk['color']) == 3 else chunk['color']
+                        pygame.draw.ellipse(
+                            blood_fx_surface,
+                            _chunk_col,
+                            (int(chunk['x']), int(chunk['y']), chunk['w'], chunk['h']),
+                        )
+                    _next_chunks.append(chunk)
+            blood_chunks = _next_chunks
+
+            del blood_decals[:-MAX_BLOOD_DECALS]
+            
+            # Blit accumulated gore to screen
+            screen.blit(blood_fx_surface, (0, 0))
+
             next_particles = []
             for p in particles:
                 p['x'] += p['vx']
@@ -2975,6 +4255,9 @@ def main() -> None:
                 _signal_pct_cache['val'] = _sig_key
                 _signal_pct_cache['surf'] = font.render(f'{_sig_pct}%', True, _sig_col)
             screen.blit(_signal_pct_cache['surf'], _signal_pct_cache['surf'].get_rect(left=238, centery=_sig_bg.centery))
+            if ancestral_protection_charges > 0:
+                _ap_guard = font.render(f'ANCESTRAL GUARD x{ancestral_protection_charges}', True, (170, 255, 220))
+                screen.blit(_ap_guard, (_sig_bg.x, _sig_bg.bottom + 6))
             if active_perks:
                 _ap_key = "  ·  ".join(active_perks)
                 if _perks_cache['val'] != _ap_key:
@@ -3005,10 +4288,12 @@ def main() -> None:
 
             if shake_timer > 0:
                 shake_timer -= 1
-                # Full-screen copy is expensive; skip it in safe mode and halve update rate otherwise.
-                if not PHOTOSENSITIVE_SAFE_MODE and frame_count % 2 == 0:
-                    ox = random.randint(-4, 4)
-                    oy = random.randint(-4, 4)
+                # Keep shake visible in safe mode with lower amplitude and fewer updates.
+                _shake_stride = 3 if PHOTOSENSITIVE_SAFE_MODE else 2
+                if frame_count % _shake_stride == 0:
+                    _shake_amp = 1 if PHOTOSENSITIVE_SAFE_MODE else 4
+                    ox = random.randint(-_shake_amp, _shake_amp)
+                    oy = random.randint(-_shake_amp, _shake_amp)
                     _shake_surf.blit(screen, (0, 0))
                     screen.fill((0, 0, 0))
                     screen.blit(_shake_surf, (ox, oy))
@@ -3029,9 +4314,27 @@ def main() -> None:
                     _brage_surf.set_alpha(_bra)
                     screen.blit(_brage_surf, _brage_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 55)))
 
+            if boss_defeat_timer == 0 and signal_burst_ring_timer > 0:
+                _sr_total = 18 if PHOTOSENSITIVE_SAFE_MODE else 24
+                _sr_life = signal_burst_ring_timer
+                signal_burst_ring_timer -= 1
+                _sr_prog = 1.0 - (_sr_life / _sr_total)
+                _sr_rad = int(16 + _sr_prog * (120 if PHOTOSENSITIVE_SAFE_MODE else 180))
+                _sr_width = max(2, int((9 if PHOTOSENSITIVE_SAFE_MODE else 13) * (1.0 - _sr_prog)))
+                _sr_alpha = max(0, int((145 if PHOTOSENSITIVE_SAFE_MODE else 230) * (1.0 - _sr_prog)))
+                _signal_ring_surf.fill((0, 0, 0, 0))
+                pygame.draw.circle(_signal_ring_surf, (255, 240, 150, _sr_alpha), (210, 210), min(200, _sr_rad), _sr_width)
+                if not PHOTOSENSITIVE_SAFE_MODE and _sr_rad > 45:
+                    pygame.draw.circle(_signal_ring_surf, (150, 230, 255, _sr_alpha // 2), (210, 210), min(205, _sr_rad + 20), 2)
+                screen.blit(_signal_ring_surf, (signal_burst_center[0] - 210, signal_burst_center[1] - 210))
+
             if boss_defeat_timer == 0 and signal_burst_flash > 0:
-                # Accessibility/safety: suppress fullscreen signal-burst flash.
+                _sf_total = 18 if PHOTOSENSITIVE_SAFE_MODE else 28
+                _sf_life = signal_burst_flash
                 signal_burst_flash -= 1
+                _sf_alpha = max(0, int((55 if PHOTOSENSITIVE_SAFE_MODE else 140) * (_sf_life / _sf_total)))
+                _death_flash_surf.fill((255, 248, 220, _sf_alpha))
+                screen.blit(_death_flash_surf, (0, 0))
 
             if boss_defeat_timer == 0 and boss_warning_timer > 0:
                 # Text-only boss warning to avoid fullscreen color wash artifacts.
@@ -3080,10 +4383,57 @@ def main() -> None:
 
             if level_intro_timer > 0:
                 _lia = min(255, int(level_intro_timer * 2.4))
-                _level2_intro_title.set_alpha(_lia)
-                screen.blit(_level2_intro_title, _level2_intro_title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 74)))
-                _level2_intro_sub.set_alpha(_lia)
-                screen.blit(_level2_intro_sub, _level2_intro_sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 26)))
+                if level == 1:
+                    # Show nothing for Level 1 (no intro banner currently)
+                    pass
+                elif level == 2:
+                    _level2_intro_title.set_alpha(_lia)
+                    screen.blit(_level2_intro_title, _level2_intro_title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 74)))
+                    _level2_intro_sub.set_alpha(_lia)
+                    screen.blit(_level2_intro_sub, _level2_intro_sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 26)))
+                elif level == 3:
+                    _level3_intro_title.set_alpha(_lia)
+                    screen.blit(_level3_intro_title, _level3_intro_title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 74)))
+                    _level3_intro_sub.set_alpha(_lia)
+                    screen.blit(_level3_intro_sub, _level3_intro_sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 26)))
+                elif level == 4:
+                    _level4_intro_title.set_alpha(_lia)
+                    screen.blit(_level4_intro_title, _level4_intro_title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 74)))
+                    _level4_intro_sub.set_alpha(_lia)
+                    screen.blit(_level4_intro_sub, _level4_intro_sub.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 26)))
+                    _stage = level_intro_timer
+                    if _stage > 132:
+                        _name_surf, _line_surf = _l4_story_allie_name_surf, _l4_story_allie_line_surf
+                        _name_shadow, _line_shadow = _l4_story_allie_name_shadow, _l4_story_allie_line_shadow
+                    elif _stage > 70:
+                        _name_surf, _line_surf = _l4_story_oracle_name_surf, _l4_story_oracle_line_surf
+                        _name_shadow, _line_shadow = _l4_story_oracle_name_shadow, _l4_story_oracle_line_shadow
+                    else:
+                        _name_surf, _line_surf = _l4_story_bless_name_surf, _l4_story_bless_line_surf
+                        _name_shadow, _line_shadow = _l4_story_bless_name_shadow, _l4_story_bless_line_shadow
+
+                    _l4_bubble_surf.fill((0, 0, 0, 0))
+                    _br = pygame.Rect(12, 12, 496, 146)
+                    pygame.draw.rect(_l4_bubble_surf, (252, 244, 255), _br, border_radius=32)
+                    pygame.draw.rect(_l4_bubble_surf, (255, 170, 255), _br, 4, border_radius=32)
+                    pygame.draw.rect(_l4_bubble_surf, (241, 229, 252), _br.inflate(-16, -16), border_radius=26)
+                    _tail = [(406, 150), (456, 166), (386, 144)]
+                    pygame.draw.polygon(_l4_bubble_surf, (252, 244, 255), _tail)
+                    pygame.draw.polygon(_l4_bubble_surf, (255, 170, 255), _tail, 4)
+                    _l4_bubble_surf.set_alpha(_lia)
+                    _brect = _l4_bubble_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 74))
+                    screen.blit(_l4_bubble_surf, _brect)
+
+                    _name_surf.set_alpha(_lia)
+                    _line_surf.set_alpha(_lia)
+                    _name_shadow.set_alpha(_lia)
+                    _line_shadow.set_alpha(_lia)
+                    _npos = _name_surf.get_rect(center=(_brect.centerx, _brect.top + 46))
+                    _lpos = _line_surf.get_rect(center=(_brect.centerx, _brect.top + 94))
+                    screen.blit(_name_shadow, _npos.move(2, 2))
+                    screen.blit(_name_surf, _npos)
+                    screen.blit(_line_shadow, _lpos.move(2, 2))
+                    screen.blit(_line_surf, _lpos)
 
             if wave_transition_timer > 0 and not boss_warned:
                 _wta = min(210, wave_transition_timer * 3)
@@ -3137,7 +4487,16 @@ def main() -> None:
             if boss_defeat_timer > 0:
                 boss_defeat_timer -= 1
                 vt_alpha = min(255, int(255 * (1.0 - boss_defeat_timer / 90.0) * 3.0))
-                _victory_text = 'VICTORY!' if level >= 2 else 'LEVEL 1 CLEAR!'
+                if level == 1:
+                    _victory_text = 'LEVEL 1 CLEAR!'
+                elif level == 2:
+                    _victory_text = 'LEVEL 2 CLEAR!'
+                elif level == 3:
+                    _victory_text = 'LEVEL 3 CLEAR!'
+                elif level == 4:
+                    _victory_text = 'VICTORY!'
+                else:
+                    _victory_text = 'VICTORY!'
                 if _banner_cache['victory']['key'] != _victory_text:
                     _banner_cache['victory']['key'] = _victory_text
                     _banner_cache['victory']['surf'] = _fit_banner_text(_victory_text, (255, 220, 0), WIDTH - 120)
@@ -3148,6 +4507,23 @@ def main() -> None:
                     if level == 1:
                         _level_two_transition(screen, clock, background_img_level_2)
                         _start_level_two()
+                    elif level == 2:
+                        _level_three_transition(screen, clock, background_img_level_3)
+                        _start_level_three()
+                    elif level == 3:
+                        pending_level_four_intro = False
+                        _level_four_transition(screen, clock, background_img_level_4)
+                        _start_level_four()
+                    elif level == 4:
+                        _oracle_victory_message(
+                            screen,
+                            clock,
+                            background_img_level_4,
+                            oracle_allie_img,
+                            sprite_idle_image,
+                        )
+                        game_won = True
+                        running  = False
                     else:
                         game_won = True
                         running  = False
@@ -3192,6 +4568,17 @@ def main() -> None:
                 pygame.display.set_caption(
                     f"Onyx G vs Space Drones | FPS: {clock.get_fps():.0f}")
 
+        append_replay_event(
+            replay_events,
+            frame_count,
+            'run_end',
+            f'score={score};won={int(game_won)};game_over={int(game_over)};continues={continues_used}',
+        )
+        try:
+            save_replay_log(replay_log_path, replay_events)
+        except Exception as err:
+            print(f"Warning: replay log save failed: {err}")
+
         # ── Save high score (top 3) ──────────────────────────────────────────────
         _earned_place = None
         for _pi, _ps in enumerate(scores):
@@ -3206,13 +4593,12 @@ def main() -> None:
                 new_score=score,
                 leaderboard_label=leaderboard_label,
             )
-            scores.insert(_earned_place, [score, _new_name])
-            scores = _normalize_scores(scores, cfg.HIGH_SCORE_ENTRIES, cfg.HIGH_SCORE_DEFAULT_NAME)
+            scores.insert(_earned_place, [score, _new_name, current_score_timestamp()])
+            scores = normalize_scores(scores, cfg.HIGH_SCORE_ENTRIES, cfg.HIGH_SCORE_DEFAULT_NAME)
             high_score      = scores[0][0]
             high_score_name = scores[0][1]
             try:
-                with open(hs_file, 'w') as _f:
-                    _f.write('\n'.join(f'{s[0]} {s[1]}' for s in scores))
+                save_scores(hs_file, scores)
             except Exception as err:
                 print(f"Warning: high score save failed: {err}")
 

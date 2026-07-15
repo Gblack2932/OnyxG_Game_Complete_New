@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from datetime import datetime
+import os
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pygame
+
+ScoreRow = List[Any]
+ScoreTable = List[ScoreRow]
+SideBulletMap = Dict[str, float]
+AimedBulletMap = Dict[str, float]
+EnemyDestroyedCallback = Callable[[Any, Tuple[int, int, int], List[Tuple[int, int, int]], int], None]
+MinionDestroyedCallback = Callable[[Any, Tuple[int, int, int], List[Tuple[int, int, int]]], None]
+PopupCallback = Callable[[int, int, int, int, str, Tuple[int, int, int]], None]
 
 
 @dataclass
@@ -12,16 +22,16 @@ class GameState:
 
     sprite_rect: pygame.Rect
     fireballs: List[pygame.Rect] = field(default_factory=list)
-    side_bullets: List[dict] = field(default_factory=list)
-    enemies: List = field(default_factory=list)
+    side_bullets: List[SideBulletMap] = field(default_factory=list)
+    enemies: List[Any] = field(default_factory=list)
     enemy_bullets: List[pygame.Rect] = field(default_factory=list)
-    aimed_bullets: List[dict] = field(default_factory=list)
+    aimed_bullets: List[AimedBulletMap] = field(default_factory=list)
     boss_bullets: List[pygame.Rect] = field(default_factory=list)
-    boss_minions: List = field(default_factory=list)
+    boss_minions: List[Any] = field(default_factory=list)
     health_pickups: List[pygame.Rect] = field(default_factory=list)
     sativa_pickups: List[pygame.Rect] = field(default_factory=list)
     data_souls: List[pygame.Rect] = field(default_factory=list)
-    score_popups: List = field(default_factory=list)
+    score_popups: List[Any] = field(default_factory=list)
 
     score: int = 0
     health: int = 0
@@ -40,8 +50,8 @@ class GameState:
 def handle_player_bullets_vs_enemies(
     state: GameState,
     perk_power_shot: bool,
-    on_enemy_destroyed: Callable,
-    on_minion_destroyed: Callable,
+    on_enemy_destroyed: EnemyDestroyedCallback,
+    on_minion_destroyed: MinionDestroyedCallback,
     on_damage_boss: Callable[[int], None],
 ) -> None:
     """Handle player projectile collisions with enemies, minions, and boss."""
@@ -83,7 +93,7 @@ def handle_player_bullets_vs_enemies(
 
 def handle_side_bullets_vs_enemies(
     state: GameState,
-    on_enemy_destroyed: Callable,
+    on_enemy_destroyed: EnemyDestroyedCallback,
 ) -> None:
     """Handle side-bullet collisions with standard enemies."""
 
@@ -107,7 +117,7 @@ def handle_side_bullets_vs_enemies(
 def handle_boss_damage(
     state: GameState,
     perk_power_shot: bool,
-    on_minion_destroyed: Callable,
+    on_minion_destroyed: MinionDestroyedCallback,
     on_damage_boss: Callable[[int], None],
 ) -> None:
     """Handle side-bullet collisions with minions and boss."""
@@ -170,7 +180,7 @@ def handle_pickups(
     state: GameState,
     powerup_sound: Optional[pygame.mixer.Sound],
     sativa_sound: Optional[pygame.mixer.Sound],
-    add_popup: Callable[[int, int, int, int, str, tuple], None],
+    add_popup: PopupCallback,
 ) -> None:
     """Handle health, sativa, and data-soul pickup collection."""
 
@@ -189,7 +199,7 @@ def handle_pickups(
             state.sativa_active = True
             state.sativa_timer = 600
             state.iframe_timer = 300
-            add_popup(state.sprite_rect.centerx, state.sprite_rect.top - 20, 75, 75, '★ SATIVA MODE ★', (0, 255, 120))
+            add_popup(state.sprite_rect.centerx, state.sprite_rect.top - 20, 75, 75, '★ HYDRATED ★', (0, 255, 120))
             if sativa_sound:
                 sativa_sound.play()
 
@@ -202,3 +212,110 @@ def handle_pickups(
             add_popup(state.sprite_rect.centerx, state.sprite_rect.top, 45, 45, 'DATA SOUL +250', (180, 80, 255))
             if powerup_sound:
                 pygame.mixer.find_channel(True).play(powerup_sound)
+
+
+def resolve_score_file(
+    base_dir: str,
+    ladder_choice: str,
+    legacy_file: str,
+    v2_file: str,
+) -> Tuple[str, str]:
+    """Return selected leaderboard file path and display label."""
+    if str(ladder_choice).lower() == 'legacy':
+        return os.path.join(base_dir, legacy_file), 'LEGACY'
+    return os.path.join(base_dir, v2_file), 'V2'
+
+
+def normalize_scores(raw_scores: ScoreTable, entries: int, default_name: str) -> ScoreTable:
+    """Return canonical top-score rows in [score, initials, timestamp] format."""
+    normalized: ScoreTable = []
+    for row in raw_scores:
+        try:
+            score = max(0, int(row[0]))
+        except (TypeError, ValueError, IndexError):
+            score = 0
+
+        try:
+            name = str(row[1]).strip().upper()[:3]
+        except (TypeError, ValueError, IndexError):
+            name = ''
+
+        try:
+            timestamp = str(row[2]).strip()
+        except (TypeError, ValueError, IndexError):
+            timestamp = ''
+
+        if not name:
+            name = default_name
+
+        normalized.append([score, name, timestamp])
+
+    normalized.sort(key=lambda row: row[0], reverse=True)
+    normalized = normalized[:entries]
+    while len(normalized) < entries:
+        normalized.append([0, default_name, ''])
+    return normalized
+
+
+def load_scores(hs_file: str, entries: int, default_name: str) -> ScoreTable:
+    """Load leaderboard rows from file, tolerating old 2-column format."""
+    scores = [[0, default_name, ''] for _ in range(entries)]
+
+    try:
+        with open(hs_file) as handle:
+            loaded: ScoreTable = []
+            for line in handle.read().strip().splitlines()[:entries]:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                try:
+                    score = int(parts[0])
+                    name = parts[1][:3].upper() if len(parts) > 1 else default_name
+                    timestamp = parts[2] if len(parts) > 2 else ''
+                    loaded.append([score, name, timestamp])
+                except ValueError:
+                    print(f"Warning: skipping malformed high score row: {line!r}")
+        return normalize_scores(loaded, entries, default_name)
+    except Exception as err:
+        print(f"Warning: high score load failed: {err}")
+        return normalize_scores(scores, entries, default_name)
+
+
+def save_scores(hs_file: str, scores: ScoreTable) -> None:
+    """Persist leaderboard rows as score/initials/timestamp."""
+    with open(hs_file, 'w') as handle:
+        handle.write('\n'.join(f'{row[0]} {row[1]} {row[2]}' for row in scores))
+
+
+def current_score_timestamp() -> str:
+    """Return local timestamp for leaderboard persistence (ISO-like, no spaces)."""
+    return datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def display_score_timestamp(value: str) -> str:
+    """Convert persisted timestamp into compact UI-safe text."""
+    if not value:
+        return ''
+    return value.replace('T', ' ')[:16]
+
+
+def build_replay_log_path(base_dir: str) -> str:
+    """Build a unique file path for the current run replay action log."""
+    replay_dir = os.path.join(base_dir, 'replays')
+    os.makedirs(replay_dir, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    return os.path.join(replay_dir, f'replay_{stamp}.log')
+
+
+def append_replay_event(events: List[str], frame: int, event_type: str, payload: str = '') -> None:
+    """Append a compact replay event line: frame|event|payload."""
+    safe_payload = payload.replace('\n', ' ').strip()
+    events.append(f"{frame}|{event_type}|{safe_payload}")
+
+
+def save_replay_log(path: str, events: List[str]) -> None:
+    """Persist replay events to disk as a readable action log."""
+    with open(path, 'w') as handle:
+        handle.write('# OnyxG Replay Action Log\n')
+        handle.write('# frame|event|payload\n')
+        handle.write('\n'.join(events))
