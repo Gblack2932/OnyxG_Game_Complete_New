@@ -1,0 +1,4 @@
+# OnyxG Replay Action Log
+# frame|event|payload
+0|run_start|difficulty=normal;max_continues=2
+5372|run_end|score=2750;won=0;game_over=1;continues=0

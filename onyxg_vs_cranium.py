@@ -1,11 +1,24 @@
+#!/usr/bin/env python3
 """
 Onyx G vs Space Drones — Main Game Loop
 A retro-arcade shmup with procedural boss AI, combo scoring, and roguelike progression.
 
 Architecture:
-  - constants.py: All game config, difficulty scaling, tuning
-  - entities.py: Typed entity classes (Enemy, Bullet, Particle, etc.)
-  - onyxg_vs_cranium.py: Asset loading, UI, and main game loop
+  - constants.py      All game config, difficulty scaling, tuning
+  - entities.py       Typed entity classes (Enemy, Bullet, Particle, etc.)
+  - systems.py        Collision resolution, scoring, replay, leaderboard I/O
+  - score.py          Rank calculation
+
+Animation system (PlayerSpriteAnimator):
+  Uses LeftAnimatons.png (left-facing) + RightAnimations.png (right-facing) as
+  the primary source.  Falls back to FlyLeftAndRight.png, then pygame transforms.
+  9 animation rows: idle, run, run+shoot, stand+shoot, shoot-up, hover,
+  jetpack-fly, jetpack+shoot, jetpack+shoot-up.
+
+Audio channels:
+  0 — impact (enemy/player hits)    1 — signal burst
+  2 — run footsteps (looping)       3 — jetpack thrust (looping)
+  music — pygame.mixer.music (background track per level)
 """
 
 from __future__ import annotations
@@ -19,6 +32,7 @@ import traceback
 from typing import List, Dict, Tuple, Optional, Any
 
 import pygame
+
 
 import constants as cfg
 from entities import (
@@ -425,6 +439,399 @@ def load_player_pose_image(dir_map: Dict[str, str], filename: str, size: Tuple[i
     return surf
 
 
+def _cut_sheet_frames(
+    sheet: pygame.Surface,
+    rects: List[Tuple[int, int, int, int]],
+    target_size: Tuple[int, int],
+) -> Tuple[pygame.Surface, ...]:
+    """
+    Slice frames from an RGBA sprite sheet, clean up, and scale.
+
+    Steps per rect:
+      1. Subsurface copy — isolates the frame region.
+      2. Edge flood-fill — removes opaque near-black label-box borders.
+         Safe on transparent-bg sheets (alpha=0 pixels are skipped).
+      3. Content crop — trims fully-transparent rows/cols from all sides.
+      4. Aspect-ratio-preserving scale — fits within target_size without distortion.
+
+    Used for both FlyLeftAndRight.png (dark label boxes) and the newer
+    LeftAnimatons.png / RightAnimations.png (transparent backgrounds).
+    """
+    tw, th = target_size
+    result = []
+    for (fx, fy, fw, fh) in rects:
+        frame = sheet.subsurface(pygame.Rect(fx, fy, fw, fh)).copy()
+        fw2, fh2 = frame.get_size()
+
+        # Edge-flood-fill: remove opaque near-black label-box backgrounds.
+        # True background has alpha ≈ 0; character clothing is never edge-connected.
+        stack = (
+            [(x, 0) for x in range(fw2)]
+            + [(x, fh2 - 1) for x in range(fw2)]
+            + [(0, y) for y in range(fh2)]
+            + [(fw2 - 1, y) for y in range(fh2)]
+        )
+        visited: set = set()
+        while stack:
+            px, py = stack.pop()
+            if (px, py) in visited:
+                continue
+            visited.add((px, py))
+            r, g, b, a = frame.get_at((px, py))
+            if a < 150:
+                continue        # transparent / semi-transparent → skip
+            if r > 20 or g > 20 or b > 20:
+                continue        # coloured character pixel → stop
+            frame.set_at((px, py), (0, 0, 0, 0))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nx, ny = px + dx, py + dy
+                if 0 <= nx < fw2 and 0 <= ny < fh2 and (nx, ny) not in visited:
+                    stack.append((nx, ny))
+
+        # Crop transparent padding.
+        trim = frame.get_bounding_rect(min_alpha=10)
+        if trim.width > 0 and trim.height > 0:
+            frame = frame.subsurface(trim).copy()
+
+        # Scale to fit within target_size preserving aspect ratio.
+        cw, ch = frame.get_size()
+        if cw > 0 and ch > 0:
+            scale = min(tw / cw, th / ch)
+            nw = max(1, int(cw * scale))
+            nh = max(1, int(ch * scale))
+            frame = pygame.transform.smoothscale(frame, (nw, nh))
+
+        result.append(frame)
+    return tuple(result)
+
+
+class PlayerSpriteAnimator:
+    """
+    Player sprite animation system.
+    Priority: LeftAnimatons.png + RightAnimations.png > FlyLeftAndRight.png > transform fallback.
+    """
+
+    _RUN_CYCLE_FRAMES       = 4   # game frames per keyframe — run
+    _RUN_SHOOT_CYCLE_FRAMES = 3   # faster during run + shoot
+    _FLY_CYCLE_FRAMES       = 5   # hover cycle
+    _FLY_SHOOT_CYCLE_FRAMES = 4   # fly + shoot
+    _SHOOT_CYCLE_FRAMES     = 3   # upward / hit flash
+
+    def __init__(
+        self,
+        idle_image: pygame.Surface,
+        shoot_image: pygame.Surface,
+        sheet: Optional[pygame.Surface] = None,
+        lsheet: Optional[pygame.Surface] = None,
+        rsheet: Optional[pygame.Surface] = None,
+    ) -> None:
+        """Bake every animation frame once at startup."""
+
+        left_facing_idle = pygame.transform.flip(idle_image, True, False)
+        shoot_right_base = pygame.transform.flip(shoot_image, True, False)
+
+        def _rot(src: pygame.Surface, angle: float) -> pygame.Surface:
+            return pygame.transform.rotate(src, angle)
+
+        def _run_frame(src: pygame.Surface, angle: float, yscale: float) -> pygame.Surface:
+            rotated = pygame.transform.rotate(src, angle)
+            rw, rh = rotated.get_size()
+            return pygame.transform.scale(rotated, (rw, max(1, int(rh * yscale))))
+
+        # ── Target sizes ────────────────────────────────────────────────────
+        STAND = cfg.PLAYER_SIZE                                      # (80, 160)
+        FLY = (int(cfg.PLAYER_SIZE[0] * 2.0), int(cfg.PLAYER_SIZE[1] * 0.65))
+
+        if lsheet is not None and rsheet is not None:
+            # ── NEW SHEETS: LeftAnimatons.png + RightAnimations.png ──────────
+            # Both sheets share identical row y-ranges (9 rows, transparent bg).
+            # L = left-facing, R = right-facing.  All frames scaled to STAND.
+            def _cl(rects, tgt=STAND): return _cut_sheet_frames(lsheet, rects, tgt)
+            def _cr(rects, tgt=STAND): return _cut_sheet_frames(rsheet, rects, tgt)
+
+            idle_f  = _cr([                       # Row 0 — idle right (5 f)
+                (40,7,113,146),(153,7,113,146),(266,7,113,146),
+                (379,7,113,146),(492,7,116,146),
+            ])
+            rr_f    = _cr([                       # Row 1 — run right (8 f)
+                (17,153,129,152),(146,153,129,152),(275,153,129,152),(404,153,129,152),
+                (533,153,129,152),(662,153,129,152),(791,153,129,152),(920,153,132,152),
+            ])
+            rl_f    = _cl([                       # Row 1 — run left (8 f)
+                (69,153,129,152),(198,153,129,152),(327,153,129,152),(456,153,129,152),
+                (585,153,129,152),(714,153,129,152),(843,153,129,152),(972,153,130,152),
+            ])
+            rsr_f   = _cr([                       # Row 2 — run+shoot right (8 f)
+                (18,305,137,146),(155,305,137,146),(292,305,137,146),(429,305,137,146),
+                (566,305,137,146),(703,305,137,146),(840,305,137,146),(977,305,144,146),
+            ])
+            rsl_f   = _cl([                       # Row 2 — run+shoot left (8 f)
+                (11,305,136,146),(147,305,136,146),(283,305,136,146),(419,305,136,146),
+                (555,305,136,146),(691,305,136,146),(827,305,136,146),(963,305,136,146),
+            ])
+            shu_f   = _cr([                       # Row 4 — shoot up RIGHT (6 f) — replaces C.png
+                (22,602,127,171),(149,602,127,171),(276,602,127,171),
+                (403,602,127,171),(530,602,127,171),(657,602,128,171),
+            ])
+            shu_l_f = _cl([                       # Row 4 — shoot up LEFT (6 f)
+                (227,602,139,171),(366,602,139,171),(505,602,139,171),
+                (644,602,139,171),(783,602,139,171),(922,602,142,171),
+            ])
+            fr_f    = _cr([                       # Row 6 — jetpack fly right (8 f)
+                (22,913,112,133),(134,913,112,133),(246,913,112,133),(358,913,112,133),
+                (470,913,112,133),(582,913,112,133),(694,913,112,133),(806,913,113,133),
+            ])
+            fl_f    = _cl([                       # Row 6 — jetpack fly left (8 f)
+                (47,913,132,133),(179,913,132,133),(311,913,132,133),(443,913,132,133),
+                (575,913,132,133),(707,913,132,133),(839,913,132,133),(971,913,132,133),
+            ])
+            fsr_f   = _cr([                       # Row 7 — jetpack+shoot right (8 f)
+                (13,1046,134,134),(147,1046,134,134),(281,1046,134,134),(415,1046,134,134),
+                (549,1046,134,134),(683,1046,134,134),(817,1046,134,134),(951,1046,136,134),
+            ])
+            fsl_f   = _cl([                       # Row 7 — jetpack+shoot left (8 f)
+                (12,1046,135,134),(147,1046,135,134),(282,1046,135,134),(417,1046,135,134),
+                (552,1046,135,134),(687,1046,135,134),(822,1046,135,134),(957,1046,142,134),
+            ])
+            fsu_r_f = _cr([                       # Row 8 — jetpack+shoot up-right (7 f) — replaces C.png
+                (17,1180,152,175),(169,1180,152,175),(321,1180,152,175),(473,1180,152,175),
+                (625,1180,152,175),(777,1180,152,175),(929,1180,152,175),
+            ])
+            fsu_l_f = _cl([                       # Row 8 — jetpack+shoot up-left (7 f)
+                (80,1180,147,175),(227,1180,147,175),(374,1180,147,175),(521,1180,147,175),
+                (668,1180,147,175),(815,1180,147,175),(962,1180,147,175),
+            ])
+            hit_f   = tuple(_cr([(22,451,159,151)]))  # Row 3 frame 0 — braced shot = hit pose
+
+            # New sheets: use actual drawn fly+shoot-up frames for directional variants
+            _fup_r  = fsu_r_f        # fly up + shoot right — actual art
+            _fup_l  = fsu_l_f        # fly up + shoot left  — actual art
+            _fdn_r  = fsr_f          # fly down + shoot right — reuse fly_shoot
+            _fdn_l  = fsl_f          # fly down + shoot left  — reuse fly_shoot
+
+        elif sheet is not None:
+            # ── LEGACY SHEET: FlyLeftAndRight.png (1448×1086) ───────────────
+            #   Row 0  y=3-159   IDLE | RUN RIGHT | RUN LEFT
+            #   Row 3  y=314-451 SHOOT RIGHT (RUN) | SHOOT LEFT (RUN)
+            #   Row 5a y=621-774  FLY RIGHT HOVER | FLY LEFT HOVER
+            #   Row 5b y=775-908  FLY SHOOT RIGHT | FLY SHOOT LEFT
+            def _c(rects, tgt=STAND): return _cut_sheet_frames(sheet, rects, tgt)
+
+            idle_f = _c([(9, 3, 70, 156), (92, 3, 74, 156)])
+
+            rr_f = _c([                          # RUN RIGHT — 6 frames
+                (272, 3, 116, 156), (388, 3, 79, 156), (467, 3, 66, 156),
+                (533, 3,  89, 156), (622, 3, 130, 156), (752, 3, 82, 156),
+            ])
+            rl_f = _c([                          # RUN LEFT — 6 frames
+                (866,  3,  76, 156), (942,  3,  87, 156), (1029, 3, 111, 156),
+                (1140, 3,  97, 156), (1237, 3,  82, 156), (1319, 3,  99, 156),
+            ])
+            rsr_f = _c([                         # RUN SHOOT RIGHT — 5 frames
+                (9,   314, 139, 137), (148, 314, 151, 137), (299, 314,  87, 137),
+                (386, 314, 124, 137), (510, 314, 167, 137),
+            ])
+            rsl_f = _c([                         # RUN SHOOT LEFT — 5 frames
+                (700,  314, 136, 137), (836,  314, 174, 137), (1010, 314, 139, 137),
+                (1149, 314, 125, 137), (1274, 314, 153, 137),
+            ])
+            fr_f = _c([                          # FLY RIGHT HOVER — 4 frames
+                (435, 621,  99, 153), (534, 621, 156, 153),
+                (690, 621, 131, 153), (821, 621, 112, 153),
+            ], FLY)
+            fl_f = _c([                          # FLY LEFT HOVER — 4 frames
+                (948,  621,  98, 153), (1046, 621, 128, 153),
+                (1174, 621, 126, 153), (1300, 621, 118, 153),
+            ], FLY)
+            fsr_f = _c([                         # FLY SHOOT RIGHT — 4 frames
+                (9,   775, 172, 133), (181, 775, 223, 133),
+                (404, 775, 101, 133), (505, 775, 219, 133),
+            ], FLY)
+            fsl_f = _c([                         # FLY SHOOT LEFT — 4 frames
+                (733,  775, 134, 133), (867,  775, 189, 133),
+                (1056, 775, 141, 133), (1197, 775, 189, 133),
+            ], FLY)
+            shu_f = (shoot_image, _rot(shoot_image, 2))
+            shu_l_f = shu_f   # legacy fallback: no separate left sheet
+            fsu_r_f = (_rot(shoot_image, -12), _rot(shoot_image, -7))
+            fsu_l_f = fsu_r_f
+            hit_f = (_rot(shoot_image, 9),)
+
+            _fup_r  = tuple(_rot(f,  14) for f in fsr_f)
+            _fup_l  = tuple(_rot(f, -14) for f in fsl_f)
+            _fdn_r  = tuple(_rot(f, -12) for f in fsr_f)
+            _fdn_l  = tuple(_rot(f,  12) for f in fsl_f)
+
+        else:
+            # ── Transform fallback when no sheets are available ──────────────
+            idle_f = (idle_image,)
+            rr_f   = (_run_frame(idle_image, -6, .96), _run_frame(idle_image, -2, 1.03),
+                      _run_frame(idle_image, -5, .95), _run_frame(idle_image, -1, 1.02))
+            rl_f   = (_run_frame(left_facing_idle, 6, .96), _run_frame(left_facing_idle, 2, 1.03),
+                      _run_frame(left_facing_idle, 5, .95), _run_frame(left_facing_idle, 1, 1.02))
+            rsr_f  = (_run_frame(idle_image, -8, .95), _run_frame(idle_image, -4, 1.03),
+                      _run_frame(idle_image, -7, .94), _run_frame(idle_image, -3, 1.02))
+            rsl_f  = (_run_frame(left_facing_idle, 8, .95), _run_frame(left_facing_idle, 4, 1.03),
+                      _run_frame(left_facing_idle, 7, .94), _run_frame(left_facing_idle, 3, 1.02))
+            fr_f   = (_rot(idle_image, -20), _rot(idle_image, -14),
+                      _rot(idle_image, -18), _rot(idle_image, -12))
+            fl_f   = (_rot(left_facing_idle, 20), _rot(left_facing_idle, 14),
+                      _rot(left_facing_idle, 18), _rot(left_facing_idle, 12))
+            fsr_f  = (_rot(shoot_right_base, -38), _rot(shoot_right_base, -32),
+                      _rot(shoot_right_base, -36), _rot(shoot_right_base, -40))
+            fsl_f  = (_rot(shoot_image, 38), _rot(shoot_image, 32),
+                      _rot(shoot_image, 36), _rot(shoot_image, 40))
+            shu_f  = (shoot_image, _rot(shoot_image, 2))
+            shu_l_f = shu_f   # transform fallback: no left sheet
+            fsu_r_f = (_rot(shoot_image, -12), _rot(shoot_image, -7))
+            fsu_l_f = fsu_r_f
+            hit_f  = (_rot(shoot_image, 9),)
+
+            _fup_r  = tuple(_rot(f,  14) for f in fsr_f)
+            _fup_l  = tuple(_rot(f, -14) for f in fsl_f)
+            _fdn_r  = tuple(_rot(f, -12) for f in fsr_f)
+            _fdn_l  = tuple(_rot(f,  12) for f in fsl_f)
+
+        self._frames: Dict[str, Tuple[pygame.Surface, ...]] = {
+            'idle':               idle_f,
+            'run_right':          rr_f,
+            'run_left':           rl_f,
+            'run_shoot_right':    rsr_f,
+            'run_shoot_left':     rsl_f,
+            'shoot_up':           shu_f,
+            'shoot_up_left':      shu_l_f,
+            'fly_right':          fr_f,
+            'fly_left':           fl_f,
+            'fly_shoot_right':    fsr_f,
+            'fly_shoot_left':     fsl_f,
+            'fly_up_shoot_right': _fup_r,
+            'fly_up_shoot_left':  _fup_l,
+            'fly_dn_shoot_right': _fdn_r,
+            'fly_dn_shoot_left':  _fdn_l,
+            'fly_shoot_up':       fsu_r_f,
+            'fly_shoot_up_left':  fsu_l_f,
+            'hit':                hit_f,
+        }
+
+        # Per-frame visual-only (x, y) offsets — hitbox is never affected.
+        if lsheet is not None and rsheet is not None:
+            # New sheets: 5/8/8/6/8/8/7 frame counts
+            self._frame_offsets: Dict[str, Tuple[Tuple[int, int], ...]] = {
+                'idle':               ((0,0),(0,0),(0,0),(0,0),(0,0)),
+                'run_right':          ((+1,+4),(0,-2),(+2,+5),(0,-3),(+1,+4),(0,-2),(+2,+5),(0,-3)),
+                'run_left':           ((-1,+4),(0,-2),(-2,+5),(0,-3),(-1,+4),(0,-2),(-2,+5),(0,-3)),
+                'run_shoot_right':    ((+1,+3),(0,-2),(+2,+4),(0,-2),(+1,+3),(0,-2),(+2,+4),(0,-2)),
+                'run_shoot_left':     ((-1,+3),(0,-2),(-2,+4),(0,-2),(-1,+3),(0,-2),(-2,+4),(0,-2)),
+                'shoot_up':           ((0,0),(0,-1),(0,-2),(0,-1),(0,0),(0,-1)),
+                'shoot_up_left':      ((0,0),(0,-1),(0,-2),(0,-1),(0,0),(0,-1)),
+                'fly_right':          ((0,0),(0,-2),(0,-3),(0,-2),(0,0),(0,-2),(0,-3),(0,-2)),
+                'fly_left':           ((0,0),(0,-2),(0,-3),(0,-2),(0,0),(0,-2),(0,-3),(0,-2)),
+                'fly_shoot_right':    ((0,0),(0,-2),(0,-3),(0,-2),(0,0),(0,-2),(0,-3),(0,-2)),
+                'fly_shoot_left':     ((0,0),(0,-2),(0,-3),(0,-2),(0,0),(0,-2),(0,-3),(0,-2)),
+                'fly_up_shoot_right': ((0,-2),(0,-4),(0,-5),(0,-4),(0,-2),(0,-4),(0,-5)),
+                'fly_up_shoot_left':  ((0,-2),(0,-4),(0,-5),(0,-4),(0,-2),(0,-4),(0,-5)),
+                'fly_dn_shoot_right': ((0,0),(0,-2),(0,-3),(0,-2),(0,0),(0,-2),(0,-3),(0,-2)),
+                'fly_dn_shoot_left':  ((0,0),(0,-2),(0,-3),(0,-2),(0,0),(0,-2),(0,-3),(0,-2)),
+                'fly_shoot_up':       ((0,-2),(0,-4),(0,-5),(0,-4),(0,-2),(0,-4),(0,-5)),
+                'fly_shoot_up_left':  ((0,-2),(0,-4),(0,-5),(0,-4),(0,-2),(0,-4),(0,-5)),
+                'hit':                ((0,0),),
+            }
+        else:
+            self._frame_offsets = {
+                'idle':               ((0,  0),(0,  0)),
+                'run_right':          ((+1,+4),(+1,-3),(+2,+5),(+1,-2),(+1,+3),(+2,-2)),
+                'run_left':           ((-1,+4),(-1,-3),(-2,+5),(-1,-2),(-1,+3),(-2,-2)),
+                'run_shoot_right':    ((+1,+3),( 0,-3),(+2,+4),( 0,-2),(+1,+2)),
+                'run_shoot_left':     ((-1,+3),( 0,-3),(-2,+4),( 0,-2),(-1,+2)),
+                'shoot_up':           ((0, 0),(0,-2)),
+                'shoot_up_left':      ((0, 0),(0,-2)),
+                'fly_right':          ((+2,-2),(+3,-5),(+2,-3),(+3,-6)),
+                'fly_left':           ((-2,-2),(-3,-5),(-2,-3),(-3,-6)),
+                'fly_shoot_right':    ((-4,-2),(-3,-5),(-4,-3),(-3,-6)),
+                'fly_shoot_left':     ((+4,-2),(+3,-5),(+4,-3),(+3,-6)),
+                'fly_up_shoot_right': ((-4,-6),(-3,-9),(-4,-7),(-3,-10)),
+                'fly_up_shoot_left':  ((+4,-6),(+3,-9),(+4,-7),(+3,-10)),
+                'fly_dn_shoot_right': ((-4, 1),(-3,-2),(-4, 0),(-3,-3)),
+                'fly_dn_shoot_left':  ((+4, 1),(+3,-2),(+4, 0),(+3,-3)),
+                'fly_shoot_up':       ((0,-1),(0,-4)),
+                'fly_shoot_up_left':  ((0,-1),(0,-4)),
+                'hit':                ((0, 0),),
+            }
+        self._last_facing = 1
+
+    def get_frame(
+            self,
+            velocity: pygame.Vector2,
+            is_upward_shooting: bool,
+            is_side_shooting: bool,
+            side_shot_direction: int,
+            is_hit: bool,
+            frame_count: int,
+    ) -> Tuple[pygame.Surface, str, Tuple[int, int]]:
+        """Return the current frame surface, pose cache key, and visual-only offset."""
+        if velocity.x > 0.45:
+            self._last_facing = 1
+        elif velocity.x < -0.45:
+            self._last_facing = -1
+
+        is_flying = abs(velocity.y) > 0.45
+        if is_hit:
+            state = 'hit'
+        elif is_side_shooting:
+            self._last_facing = 1 if side_shot_direction >= 0 else -1
+            direction = 'right' if self._last_facing > 0 else 'left'
+            if is_flying:
+                if velocity.y < -0.45:       # moving upward
+                    state = f'fly_up_shoot_{direction}'
+                elif velocity.y > 0.45:      # moving downward
+                    state = f'fly_dn_shoot_{direction}'
+                else:
+                    state = f'fly_shoot_{direction}'
+            else:
+                state = f'run_shoot_{direction}'
+        elif is_upward_shooting:
+            direction = 'right' if self._last_facing > 0 else 'left'
+            if is_flying:
+                state = 'fly_shoot_up' if direction == 'right' else 'fly_shoot_up_left'
+            else:
+                state = 'shoot_up' if direction == 'right' else 'shoot_up_left'
+        elif is_flying:
+            direction = 'right' if self._last_facing > 0 else 'left'
+            state = f'fly_{direction}'
+        elif velocity.x > 0.45:
+            state = 'run_right'
+        elif velocity.x < -0.45:
+            state = 'run_left'
+        else:
+            state = 'idle'
+
+        frames = self._frames[state]
+        if len(frames) == 1:
+            frame_index = 0
+        elif state in ('run_shoot_right', 'run_shoot_left'):
+            frame_index = (frame_count // self._RUN_SHOOT_CYCLE_FRAMES) % len(frames)
+        elif state in ('fly_shoot_right', 'fly_shoot_left',
+                        'fly_up_shoot_right', 'fly_up_shoot_left',
+                        'fly_dn_shoot_right', 'fly_dn_shoot_left'):
+            frame_index = (frame_count // self._FLY_SHOOT_CYCLE_FRAMES) % len(frames)
+        elif 'shoot' in state:
+            frame_index = (frame_count // self._SHOOT_CYCLE_FRAMES) % len(frames)
+        elif state.startswith('fly_'):
+            frame_index = (frame_count // self._FLY_CYCLE_FRAMES) % len(frames)
+        else:
+            frame_index = (frame_count // self._RUN_CYCLE_FRAMES) % len(frames)
+
+        offset_x, offset_y = self._frame_offsets[state][
+            frame_index % len(self._frame_offsets[state])
+        ]
+        if state.startswith('fly_'):
+            offset_y += int(math.sin(frame_count * 0.32) * 4) - 3
+        elif state == 'idle':
+            offset_y += int(math.sin(frame_count * 0.12) * 2)
+
+        return frames[frame_index], f'{state}:{frame_index}', (offset_x, offset_y)
+
+
 def load_image_remove_dark_bg(dir_map: Dict[str, str], filename: str, size: Tuple[int, int], threshold: int = 8) -> pygame.Surface:
     """
     Loads a sprite and removes very dark background pixels.
@@ -555,6 +962,46 @@ def _make_powerup_sound() -> pygame.mixer.Sound:
     return snd
 
 
+def _make_landing_sound() -> pygame.mixer.Sound:
+    """Procedural low-frequency thud for jetpack landing."""
+    sr, dur = 44100, 0.18
+    n = int(sr * dur)
+    samples = []
+    for i in range(n):
+        t = i / sr
+        env = math.exp(-t * 28)          # fast exponential decay
+        freq = 70 * math.exp(-t * 12)    # pitch falls from 70 Hz down
+        sine  = math.sin(2 * math.pi * freq * t)
+        noise = random.uniform(-0.35, 0.35)
+        val = int((sine * 0.65 + noise * 0.35) * env * 30000)
+        samples.append(max(-32768, min(32767, val)))
+    stereo = array.array('h', [s for s in samples for _ in range(2)])
+    snd = pygame.mixer.Sound(buffer=stereo)
+    snd.set_volume(0.55)
+    return snd
+
+
+def _make_combo_sound(base_hz: float, peak_hz: float, dur: float) -> pygame.mixer.Sound:
+    """Short ascending chirp for combo milestone feedback.
+    Pitch sweeps from base_hz to peak_hz over dur seconds.
+    Higher combos get higher base/peak and shorter duration for urgency.
+    """
+    sr = 44100
+    n  = int(sr * dur)
+    fade = max(1, int(sr * 0.015))   # 15 ms fade-in / fade-out
+    samples = []
+    for i in range(n):
+        t   = i / sr
+        env = (min(i, n - i, fade) / fade)  # linear fade in/out
+        hz  = base_hz + (peak_hz - base_hz) * (t / dur) ** 0.6
+        val = int(math.sin(2 * math.pi * hz * t) * env * 24000)
+        samples.append(max(-32768, min(32767, val)))
+    stereo = array.array('h', [s for s in samples for _ in range(2)])
+    snd = pygame.mixer.Sound(buffer=stereo)
+    snd.set_volume(0.55)
+    return snd
+
+
 def _make_signal_burst_sound() -> pygame.mixer.Sound:
     """Generate a layered low-boom + bright sweep for Signal Burst activation."""
     sr, dur = 44100, 0.42
@@ -574,6 +1021,42 @@ def _make_signal_burst_sound() -> pygame.mixer.Sound:
     stereo = array.array('h', [s for s in samples for _ in range(2)])
     snd = pygame.mixer.Sound(buffer=stereo)
     snd.set_volume(0.7)
+    return snd
+
+
+def _make_near_miss_sound() -> pygame.mixer.Sound:
+    """Descending whoosh (900→150 Hz) played when an enemy bullet just misses."""
+    sr, dur = 44100, 0.13
+    n = int(sr * dur)
+    samples = []
+    for i in range(n):
+        t     = i / sr
+        env   = max(0.0, 1.0 - (t / dur) ** 0.5)   # convex fast decay
+        freq  = 900.0 - 750.0 * (t / dur)           # 900 → 150 Hz sweep
+        sine  = math.sin(2 * math.pi * freq * t)
+        noise = random.uniform(-1.0, 1.0)
+        val   = int((sine * 0.5 + noise * 0.5) * env * 22000)
+        samples.append(max(-32768, min(32767, val)))
+    stereo = array.array('h', [s for s in samples for _ in range(2)])
+    snd = pygame.mixer.Sound(buffer=stereo)
+    snd.set_volume(0.32)
+    return snd
+
+
+def _make_countdown_tick_sound() -> pygame.mixer.Sound:
+    """Short crisp descending beep — arcade-style countdown tick for last 3 seconds."""
+    sr, dur = 44100, 0.10
+    n = int(sr * dur)
+    fade = max(1, int(sr * 0.008))
+    samples = []
+    for i in range(n):
+        env = min(i, n - i, fade) / fade
+        hz  = 1050.0 - 550.0 * (i / n)    # 1050 → 500 Hz descending sweep
+        val = int(math.sin(2 * math.pi * hz * (i / sr)) * env * 26000)
+        samples.append(max(-32768, min(32767, val)))
+    stereo = array.array('h', [s for s in samples for _ in range(2)])
+    snd = pygame.mixer.Sound(buffer=stereo)
+    snd.set_volume(0.45)
     return snd
 
 
@@ -1023,7 +1506,7 @@ def _level_two_transition(screen: pygame.Surface, clock: pygame.time.Clock,
             t = (_f - _ends[2]) / _P[3]
             screen.blit(background_img, (0, 0))
             _pulse = 205 if PHOTOSENSITIVE_SAFE_MODE else int(220 + 35 * abs(math.sin(_f * 0.14)))
-            _l2c = pygame.font.SysFont("Arial", 72, bold=True).render("LEVEL 2", True, (255, _pulse // 2, _pulse // 2))
+            _l2c = _ft.render("LEVEL 2", True, (255, _pulse // 2, _pulse // 2))
             screen.blit(_l2c, _l2c.get_rect(center=(W // 2, H // 2 - 50)))
             if t > 0.15:
                 _sa = min(255, int((t - 0.15) / 0.3 * 255))
@@ -1106,7 +1589,7 @@ def _level_three_transition(screen: pygame.Surface, clock: pygame.time.Clock,
             t = (_f - _ends[2]) / _P[3]
             screen.blit(background_img, (0, 0))
             _pulse = 220 if PHOTOSENSITIVE_SAFE_MODE else int(240 + 40 * abs(math.sin(_f * 0.12)))
-            _l3c = pygame.font.SysFont("Arial", 72, bold=True).render("LEVEL 3", True, (255, _pulse // 2, 0))
+            _l3c = _ft.render("LEVEL 3", True, (255, _pulse // 2, 0))
             screen.blit(_l3c, _l3c.get_rect(center=(W // 2, H // 2 - 50)))
             if t > 0.15:
                 _sa = min(255, int((t - 0.15) / 0.3 * 255))
@@ -1795,19 +2278,30 @@ def build_rage_vignette(width: int, height: int, color: Tuple[int, int, int], ba
 
 def main() -> None:
     """
-    Main game loop initialization and execution.
-    
-    Handles:
-    - Asset loading and caching
-    - Menu flow (start, tutorial, gameplay, results)
-    - Audio initialization
-    - Outer restart loop for consecutive runs
+    Entry point — initializes everything and runs the outer restart loop.
+
+    Startup sequence:
+      1. pygame.mixer.pre_init + pygame.init
+      2. Dedicated audio channels (0-3) reserved before any sound loads
+      3. Asset loading: images, sprite sheets, sounds, fonts
+      4. PlayerSpriteAnimator constructed with Left/Right sprite sheets
+      5. Menu → Tutorial (optional) → Gameplay inner loop → Results screen
+      6. Outer loop allows consecutive runs without relaunching the process
     """
     pygame.mixer.pre_init(cfg.AUDIO_INIT_FREQ, cfg.AUDIO_INIT_SIZE, 
                           cfg.AUDIO_INIT_CHANNELS, cfg.AUDIO_INIT_BUFFER)
     pygame.init()
-    impact_channel = pygame.mixer.Channel(0)  # dedicated channel — never dropped
-    burst_channel = pygame.mixer.Channel(1)   # dedicated channel for signal burst punch
+    # ── Xbox / gamepad controller support ─────────────────────────────────────
+    pygame.joystick.init()
+    _joy = None   # connected Joystick object, or None if no controller
+    if pygame.joystick.get_count() > 0:
+        _joy = pygame.joystick.Joystick(0)
+        _joy.init()
+        print(f"🎮 Controller connected: {_joy.get_name()}")
+    impact_channel   = pygame.mixer.Channel(0)  # ch 0: enemy/player hits — never dropped
+    burst_channel    = pygame.mixer.Channel(1)  # ch 1: signal burst punch
+    run_channel      = pygame.mixer.Channel(2)  # ch 2: run footsteps (looping)
+    jetpack_channel  = pygame.mixer.Channel(3)  # ch 3: jetpack thrust (looping)
 
     WIDTH, HEIGHT = cfg.WIDTH, cfg.HEIGHT
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -1829,6 +2323,16 @@ def main() -> None:
         dir_map,
         "C.png",
         cfg.PLAYER_SIZE
+    )
+    _anim_sheet_path = find_file(dir_map, "FlyLeftAndRight.png")
+    _anim_sheet = pygame.image.load(_anim_sheet_path).convert_alpha() if _anim_sheet_path else None
+    _lsheet_path = find_file(dir_map, "LeftAnimatons.png")
+    _rsheet_path = find_file(dir_map, "RightAnimations.png")
+    _lsheet = pygame.image.load(_lsheet_path).convert_alpha() if _lsheet_path else None
+    _rsheet = pygame.image.load(_rsheet_path).convert_alpha() if _rsheet_path else None
+    player_animator = PlayerSpriteAnimator(
+        sprite_idle_image, sprite_shoot_image,
+        sheet=_anim_sheet, lsheet=_lsheet, rsheet=_rsheet,
     )
     # Keep this name for existing rect init and fallback paths.
     sprite_image       = sprite_idle_image
@@ -1994,6 +2498,57 @@ def main() -> None:
         except pygame.error:
             pass
 
+    run_sound = None
+    _run_sf = find_file(dir_map, "RunningSound.ogg")
+    if _run_sf:
+        try:
+            run_sound = pygame.mixer.Sound(_run_sf)
+            run_sound.set_volume(0.7)
+            print("🏃 Run sound loaded.")
+        except pygame.error as err:
+            print(f"⚠️ Run sound disabled: {err}")
+
+    jetpack_sound = None
+    _jetpack_sf = find_file(dir_map, "JetpackSound.ogg")
+    if _jetpack_sf:
+        try:
+            jetpack_sound = pygame.mixer.Sound(_jetpack_sf)
+            jetpack_sound.set_volume(0.5)
+            print("🚀 Jetpack sound loaded.")
+        except pygame.error as err:
+            print(f"⚠️ Jetpack sound disabled: {err}")
+
+    try:
+        landing_sound = _make_landing_sound()
+    except Exception as err:
+        landing_sound = None
+        print(f"⚠️ Landing sound disabled: {err}")
+
+    try:
+        near_miss_sound = _make_near_miss_sound()
+    except Exception as err:
+        near_miss_sound = None
+        print(f"⚠️ Near-miss sound disabled: {err}")
+
+    try:
+        countdown_tick_sound = _make_countdown_tick_sound()
+    except Exception as err:
+        countdown_tick_sound = None
+        print(f"⚠️ Countdown tick sound disabled: {err}")
+
+    # Combo milestone sounds: 4 escalating chirps for x5 / x10 / x15 / x20+
+    # Each level gets a higher base frequency and shorter, snappier duration.
+    try:
+        combo_sounds = [
+            _make_combo_sound( 520,  820, 0.13),   # x5  — warm
+            _make_combo_sound( 720, 1100, 0.11),   # x10 — bright
+            _make_combo_sound( 950, 1500, 0.09),   # x15 — sharp
+            _make_combo_sound(1200, 2000, 0.07),   # x20 — piercing
+        ]
+    except Exception as err:
+        combo_sounds = []
+        print(f"⚠️ Combo sounds disabled: {err}")
+
     font     = pygame.font.SysFont("Arial", 24)
     font_big = pygame.font.SysFont("Arial", 64, bold=True)
     font_med = pygame.font.SysFont("Arial", 36)
@@ -2058,9 +2613,12 @@ def main() -> None:
     _scale_cache  = {'key': None, 'surf': None}   # sprite transform.scale cache
     _streak_cache = {'key': None, 'surf': None}   # streak message text cache
     _combo_cache  = {'val': None, 'surf': None}    # combo counter text cache
-    _block_pct_cache = {'val': None, 'col': None, 'surf': None}
-    _signal_pct_cache = {'val': None, 'col': None, 'surf': None}
-    _enemy_roll_cache = {}
+    _block_pct_cache  = {'val': None, 'col': None, 'surf': None}
+    _signal_pct_cache  = {'val': None, 'col': None, 'surf': None}
+    _ap_guard_cache    = {'val': -1, 'surf': None}   # ANCESTRAL GUARD counter
+    _crem_cache        = {'val': -1, 'surf': None}   # continues-remaining text
+    _cn_surf_cache: dict = {}                         # countdown digit (keyed on (secs, color))
+    _enemy_roll_cache  = {}
     # Banner cache avoids repeated font.render/_fit_banner_text in the render hot path.
     _banner_cache = {
         'wave_intro': {'key': None, 'title': None, 'mult': None},
@@ -2092,7 +2650,9 @@ def main() -> None:
         min_size=18,
     )
     # Pre-rendered static banner surfaces (text/color never change)
-    _brage_surf      = font_big.render('\u2620  RAGE  MODE  \u2620', True, (255, 40, 40))
+    _cont_q_surf      = font_big.render('CONTINUE?', True, (255, 220, 50))
+    _cont_press_surf  = font_med.render('PRESS  SPACE  TO  CONTINUE', True, (200, 200, 255))
+    _brage_surf       = font_big.render('\u2620  RAGE  MODE  \u2620', True, (255, 40, 40))
     _warn_text_surf  = font_big.render('\u26a0  WARNING  \u26a0', True, (255, 50, 50))
     _swarm_text_surf = font_big.render('\u26a1  DRONE SWARM!  \u26a1', True, (255, 150, 0))
     _trauma_text_surf = font_big.render('TRAUMA MODE', True, (255, 90, 90))
@@ -2310,18 +2870,31 @@ def main() -> None:
         _wet_frames = BLOOD_WET_FRAMES if wet_frames is None else max(0, int(wet_frames))
         _decal_life_scale = max(0.2, float(decal_life_scale))
         _gloss_scale = max(0.2, float(gloss_scale))
+        _bias_mag = math.hypot(bx, by)
+        _dir_x, _dir_y = ((bx / _bias_mag), (by / _bias_mag)) if _bias_mag > 0.001 else (0.0, 0.0)
         for _ in range(total):
             angle = random.uniform(0.0, math.tau)
             speed = random.uniform(1.8, 6.5) * (0.80 + intensity * 0.28)
             _x = float(cx + random.randint(-5, 5))
             _y = float(cy + random.randint(-5, 5))
+            if intensity >= 1.5 and _bias_mag > 0.001:
+                # Heavy hits get a forward cone so the splatter reads as directional.
+                _cone_push = random.uniform(0.8, 2.8) * (0.7 + intensity * 0.22)
+                _spread = random.uniform(-0.95, 0.95)
+                _x += _dir_x * random.uniform(0, 8)
+                _y += _dir_y * random.uniform(0, 8)
+                _vx = math.cos(angle) * speed + bx + _dir_x * _cone_push + (-_dir_y * _spread)
+                _vy = math.sin(angle) * speed + by + _dir_y * _cone_push + (_dir_x * _spread)
+            else:
+                _vx = math.cos(angle) * speed + bx
+                _vy = math.sin(angle) * speed + by
             blood_droplets.append({
                 'x': _x,
                 'y': _y,
                 'px': _x,
                 'py': _y,
-                'vx': math.cos(angle) * speed + bx,
-                'vy': math.sin(angle) * speed + by,
+                'vx': _vx,
+                'vy': _vy,
                 'life': random.randint(24, 52),
                 'max': 52,
                 'radius': random.randint(1, 3),
@@ -2468,6 +3041,8 @@ def main() -> None:
         aimed_bullets      = []
         side_bullets       = []
         side_fire_timer    = 0
+        side_shoot_pose_timer = 0
+        side_shot_direction = -1
         boss_minions       = []
         boss_minion_timer  = 0
         boss_minion_interval = 120
@@ -2528,11 +3103,13 @@ def main() -> None:
         swarm_msg_timer       = 0
         next_event_frame      = random.randint(500, 800)
         near_miss_ids         = set()
+        near_miss_sound_timer = 0
         chroma_timer          = 0
         boss_death_spiral     = False
         boss_spiral_angle     = 0.0
         trauma_mode           = False
         level4_drone_timer    = 0
+        _prev_pose_state      = ''   # tracks last frame's animation state for transition events
         dive_timer            = random.randint(
             WAVE_DIVE_COOLDOWN_MIN[wave - 1], WAVE_DIVE_COOLDOWN_MAX[wave - 1]
         )   # Galaga dive countdown
@@ -2644,7 +3221,7 @@ def main() -> None:
                 boss_rect.centerx,
                 boss_rect.centery,
                 intensity=3.0,
-                bias=(0.0, -0.5),
+                bias=(0.0, -1.2),
                 stains=5,
                 wet_frames=260,
                 gloss_scale=1.6,
@@ -2997,6 +3574,8 @@ def main() -> None:
             if health <= 0:
                 game_over = True
                 continue_timer = 600
+                run_channel.stop()
+                jetpack_channel.stop()
 
         def _drop_enemy_rewards(cx, cy, top_y):
             nonlocal sativa_dropped
@@ -3020,6 +3599,10 @@ def main() -> None:
             cx, cy = enemy[0].centerx, enemy[0].centery
             combo += 1
             combo_timer = 120
+            # Combo milestone audio reward: escalates every 5 kills
+            if combo_sounds and combo in (5, 10, 15) or (combo_sounds and combo >= 20 and combo % 5 == 0):
+                _clvl = 0 if combo < 10 else 1 if combo < 15 else 2 if combo < 20 else 3
+                combo_sounds[_clvl].play()
             points = int((200 if enemy[2] else 100) * combo * WAVE_MULT[wave - 1])
             score += points
             signal_meter = min(signal_max, signal_meter + 2)
@@ -3048,7 +3631,7 @@ def main() -> None:
                 cx,
                 cy,
                 intensity=gore_force,
-                bias=(random.uniform(-0.8, 0.8), 0.6),
+                bias=(random.uniform(-1.25, 1.25), 0.9),
                 stains=3 if _is_elite else 1,
                 wet_frames=190 if _is_elite else BLOOD_WET_FRAMES,
                 gloss_scale=1.3 if _is_elite else 0.95,
@@ -3125,8 +3708,24 @@ def main() -> None:
                 if event.type == pygame.QUIT:
                     pygame.quit()
                     sys.exit()
-                if continue_timer > 0 and event.type == pygame.KEYDOWN:
-                    if event.key in (pygame.K_SPACE, pygame.K_RETURN) and continues_used < max_continues:
+                # ── Controller hot-plug ────────────────────────────────────
+                if event.type == pygame.JOYDEVICEADDED and _joy is None:
+                    _joy = pygame.joystick.Joystick(event.device_index)
+                    _joy.init()
+                    print(f"🎮 Controller connected: {_joy.get_name()}")
+                elif event.type == pygame.JOYDEVICEREMOVED:
+                    _joy = None
+                    print("🎮 Controller disconnected.")
+                # ── Continue screen ────────────────────────────────────────
+                _do_continue = (
+                    event.type == pygame.KEYDOWN
+                    and event.key in (pygame.K_SPACE, pygame.K_RETURN)
+                ) or (
+                    event.type == pygame.JOYBUTTONDOWN
+                    and _joy is not None and event.button == 0  # A button
+                )
+                if continue_timer > 0 and _do_continue:
+                    if continues_used < max_continues:
                         continues_used += 1
                         health = max(1, min(8, 3 + max(0, player_health_bonus)))
                         game_over = False
@@ -3136,11 +3735,23 @@ def main() -> None:
                     elif continues_used >= max_continues:
                         running = False
                         continue_timer = 0
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE \
-                        and not show_upgrade and continue_timer == 0:
+                # ── Pause toggle (ESC  or  Start/B) ───────────────────────
+                _toggle_pause = (
+                    event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+                ) or (
+                    event.type == pygame.JOYBUTTONDOWN
+                    and _joy is not None and event.button in (1, 7)  # B or Start
+                )
+                if _toggle_pause and not show_upgrade and continue_timer == 0:
                     paused = not paused
-                if (event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT
-                        and signal_meter >= signal_max and not show_upgrade
+                # ── Signal burst (LSHIFT  or  LB) ─────────────────────────
+                _do_burst = (
+                    event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT
+                ) or (
+                    event.type == pygame.JOYBUTTONDOWN
+                    and _joy is not None and event.button == 4  # LB
+                )
+                if (_do_burst and signal_meter >= signal_max and not show_upgrade
                         and continue_timer == 0 and not paused):
                     signal_burst_center = sprite_rect.center
                     enemy_bullets.clear()
@@ -3182,6 +3793,10 @@ def main() -> None:
                         if event.key == pygame.K_1:   _uidx = 0
                         elif event.key == pygame.K_2: _uidx = 1
                         elif event.key == pygame.K_3: _uidx = 2
+                    elif event.type == pygame.JOYBUTTONDOWN and _joy is not None:
+                        if event.button == 0:   _uidx = 0   # A  → slot 1
+                        elif event.button == 2: _uidx = 1   # X  → slot 2
+                        elif event.button == 3: _uidx = 2   # Y  → slot 3
                     elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                         _ucw, _uch, _ugap = WIDTH - 80, 140, 18
                         _usx = (WIDTH - _ucw) // 2
@@ -3214,20 +3829,35 @@ def main() -> None:
                     # ── CONTINUE? screen ─────────────────────────────────
                     _cd_secs = max(0, continue_timer // 60)
                     screen.blit(_cont_ov, (0, 0))
-                    _ct = font_big.render('CONTINUE?', True, (255, 220, 50))
-                    screen.blit(_ct, _ct.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 100)))
-                    _cn_col = (255, 60, 60) if _cd_secs <= 3 else (255, 200, 60)
-                    _cn = font_huge.render(str(_cd_secs), True, _cn_col)
-                    screen.blit(_cn, _cn.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 15)))
+                    screen.blit(_cont_q_surf, _cont_q_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 100)))
+                    # Frames since last whole-second tick: 0 on the tick frame, rises after
+                    _ftick = (60 - continue_timer % 60) % 60
+                    if _ftick == 0 and 0 < continue_timer <= 180:
+                        if countdown_tick_sound:
+                            countdown_tick_sound.play()
+                    # Color: white flash on tick decays to red over 18 frames
+                    if _cd_secs <= 3:
+                        _pt = max(0.0, 1.0 - _ftick / 18.0) if continue_timer <= 180 else 0.0
+                        _cn_col = (255, int(60 + 195 * _pt), int(60 + 195 * _pt))
+                    else:
+                        _cn_col = (255, 200, 60)
+                    _cn_key = (_cd_secs, _cn_col)
+                    if _cn_key not in _cn_surf_cache:
+                        _cn_surf_cache[_cn_key] = font_huge.render(str(_cd_secs), True, _cn_col)
+                    screen.blit(_cn_surf_cache[_cn_key],
+                                _cn_surf_cache[_cn_key].get_rect(center=(WIDTH // 2, HEIGHT // 2 + 15)))
                     _rem = max_continues - continues_used
-                    _crem = font_med.render(
-                        f'{_rem}  CONTINUE{"S" if _rem != 1 else ""}  REMAINING',
-                        True, (180, 80, 255))
-                    screen.blit(_crem, _crem.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 105)))
+                    if _crem_cache['val'] != _rem:
+                        _crem_cache['val'] = _rem
+                        _crem_cache['surf'] = font_med.render(
+                            f'{_rem}  CONTINUE{"S" if _rem != 1 else ""}  REMAINING',
+                            True, (180, 80, 255))
+                    screen.blit(_crem_cache['surf'],
+                                _crem_cache['surf'].get_rect(center=(WIDTH // 2, HEIGHT // 2 + 105)))
                     _cpa = int(200 + 55 * abs(math.sin(frame_count * 0.18)))
-                    _cp = font_med.render('PRESS  SPACE  TO  CONTINUE', True, (200, 200, 255))
-                    _cp.set_alpha(_cpa)
-                    screen.blit(_cp, _cp.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 150)))
+                    _cont_press_surf.set_alpha(_cpa)
+                    screen.blit(_cont_press_surf,
+                                _cont_press_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 150)))
                 else:
                     # ── Dramatic GAME OVER screen ─────────────────────────
                     screen.fill((25, 0, 10))
@@ -3271,6 +3901,20 @@ def main() -> None:
                     int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT]),
                     int(keys[pygame.K_DOWN]) - int(keys[pygame.K_UP]),
                 )
+                # Left stick overrides keyboard when outside dead zone.
+                if _joy is not None:
+                    _DEAD = 0.15
+                    _jx = _joy.get_axis(0); _jy = _joy.get_axis(1)
+                    if abs(_jx) < _DEAD: _jx = 0.0
+                    if abs(_jy) < _DEAD: _jy = 0.0
+                    # D-pad (buttons 11-14 on Xbox Series X + macOS SDL2)
+                    if _joy.get_numbuttons() > 14:
+                        if _joy.get_button(11):   _jy = -1.0
+                        elif _joy.get_button(12): _jy =  1.0
+                        if _joy.get_button(13):   _jx = -1.0
+                        elif _joy.get_button(14): _jx =  1.0
+                    if _jx != 0.0 or _jy != 0.0:
+                        move_input = pygame.Vector2(_jx, _jy)
                 # Prevent diagonal turbo speed.
                 if move_input.length_squared() > 1.0:
                     move_input = move_input.normalize()
@@ -3320,20 +3964,48 @@ def main() -> None:
                 fire_timer = max(0, fire_timer - 1)
                 side_fire_timer = max(0, side_fire_timer - 1)
                 shoot_pose_timer = max(0, shoot_pose_timer - 1)
+                side_shoot_pose_timer = max(0, side_shoot_pose_timer - 1)
                 # Space = shoot up.
-                if keys[pygame.K_SPACE] and len(fireballs) < 20 and fire_timer == 0:
+                _fire_held = keys[pygame.K_SPACE] or (_joy is not None and _joy.get_axis(5) > 0.20)
+                if _fire_held and len(fireballs) < 20 and fire_timer == 0:
                     shoot_pose_timer = SHOOT_POSE_FRAMES
                     if perk_double_shot or sativa_active:
                         fireballs.append(pygame.Rect(sprite_rect.centerx - 16, sprite_rect.top, 8, 16))
                         fireballs.append(pygame.Rect(sprite_rect.centerx + 8,  sprite_rect.top, 8, 16))
                     else:
                         fireballs.append(pygame.Rect(sprite_rect.centerx - 4, sprite_rect.top, 8, 16))
+                    # Muzzle flash — Contra-style spark burst at gun barrel
+                    _mz_x = float(sprite_rect.centerx)
+                    _mz_y = float(sprite_rect.top + 2)
+                    for _ in range(4):
+                        particles.append({
+                            'x': _mz_x + random.uniform(-5, 5),
+                            'y': _mz_y,
+                            'vx': random.uniform(-2.0, 2.0),
+                            'vy': random.uniform(-4.5, -1.0),
+                            'life': random.randint(3, 5),
+                            'max': 5,
+                            'color': random.choice([(255, 255, 180), (255, 200, 50), (255, 130, 20)]),
+                        })
                     fire_timer = perk_fire_cooldown
                     if shoot_sound:
                         shoot_sound.play()
-                # Command = shoot sideways
-                _cmd = keys[pygame.K_LMETA] or keys[pygame.K_RMETA]
+                # Command = shoot sideways. The pose follows horizontal movement,
+                # or alternates sides while the player is standing still.
+                _cmd = (keys[pygame.K_LMETA] or keys[pygame.K_RMETA]
+                        or (_joy is not None and _joy.get_button(5)))  # RB
                 if _cmd and side_fire_timer == 0:
+                    side_shoot_pose_timer = SHOOT_POSE_FRAMES
+                    if move_input.x > 0:
+                        side_shot_direction = 1
+                    elif move_input.x < 0:
+                        side_shot_direction = -1
+                    elif player_velocity.x > 0.45:
+                        side_shot_direction = 1
+                    elif player_velocity.x < -0.45:
+                        side_shot_direction = -1
+                    else:
+                        side_shot_direction *= -1
                     cy = float(sprite_rect.centery)
                     cx = float(sprite_rect.centerx)
                     _spds = FIREBALL_SPEED + (2 if sativa_active else 0)
@@ -3349,15 +4021,48 @@ def main() -> None:
                             {'x': cx, 'y': cy, 'vx': -_spds, 'vy': 0},
                             {'x': cx, 'y': cy, 'vx':  _spds, 'vy': 0},
                         ]
+                    # Muzzle flash — Contra-style spark burst (fires both directions)
+                    for _ in range(4):
+                        particles.append({
+                            'x': cx + random.uniform(-8, 8),
+                            'y': cy + random.uniform(-8, 8),
+                            'vx': random.choice([-1, 1]) * random.uniform(3.0, 6.0),
+                            'vy': random.uniform(-1.5, 1.5),
+                            'life': random.randint(3, 5),
+                            'max': 5,
+                            'color': random.choice([(255, 255, 180), (255, 200, 50), (255, 130, 20)]),
+                        })
                     side_fire_timer = perk_fire_cooldown
                     if shoot_sound:
                         shoot_sound.play()
 
             for f in fireballs:
                 f.y -= int(FIREBALL_SPEED * dt_mul)
+                if sativa_active:
+                    # Water drip trail — droplets scatter off the trailing edge
+                    particles.append({
+                        'x': float(f.centerx) + random.uniform(-4, 4),
+                        'y': float(f.bottom),
+                        'vx': random.uniform(-1.5, 1.5),
+                        'vy': random.uniform(-0.5, 1.2),
+                        'life': random.randint(6, 10),
+                        'max': 10,
+                        'color': random.choice([(0, 200, 255), (30, 220, 200), (0, 180, 240)]),
+                    })
             fireballs = [f for f in fireballs if f.y > -20]
             for sb in side_bullets:
                 sb['x'] += sb['vx'] * dt_mul
+                if sativa_active:
+                    # Water drip trail — droplets fall from fast-moving side rounds
+                    particles.append({
+                        'x': float(sb['x']) - (9 if sb['vx'] > 0 else -9),
+                        'y': float(sb['y']) + random.uniform(-3, 3),
+                        'vx': random.uniform(-0.8, 0.8),
+                        'vy': random.uniform(0.5, 2.5),
+                        'life': random.randint(5, 9),
+                        'max': 9,
+                        'color': random.choice([(0, 200, 255), (30, 220, 200), (0, 180, 240)]),
+                    })
             side_bullets = [sb for sb in side_bullets if 0 < sb['x'] < WIDTH]
 
             frame_count += 1
@@ -3370,6 +4075,7 @@ def main() -> None:
                 if sativa_timer <= 0:
                     sativa_active = False
             iframe_timer = max(0, iframe_timer - 1)
+            near_miss_sound_timer = max(0, near_miss_sound_timer - 1)
             if combo_timer > 0:
                 combo_timer -= 1
             else:
@@ -3667,6 +4373,8 @@ def main() -> None:
                 game_over = True
                 continue_timer = 0
                 running = False
+                run_channel.stop()
+                jetpack_channel.stop()
                 score_popups.append(ScorePopup(
                     x=WIDTH // 2,
                     y=HEIGHT // 2 - 80,
@@ -3706,6 +4414,9 @@ def main() -> None:
                     if (math.hypot(_nmb.centerx - _pcx, _nmb.centery - _pcy) < 38
                             and not _nmb.colliderect(sprite_rect)):
                         near_miss_ids.add(id(_nmb))
+                        if near_miss_sound and near_miss_sound_timer == 0:
+                            near_miss_sound.play()
+                            near_miss_sound_timer = 25
                         run_stats['total_near_misses'] += 1
                         wave_stats['wave_near_misses'] += 1
                         score += 50
@@ -3730,6 +4441,9 @@ def main() -> None:
                     if (math.hypot(_nmab['x'] - _pcx, _nmab['y'] - _pcy) < 38
                             and not _nmab_r.colliderect(sprite_rect)):
                         near_miss_ids.add(id(_nmab))
+                        if near_miss_sound and near_miss_sound_timer == 0:
+                            near_miss_sound.play()
+                            near_miss_sound_timer = 25
                         run_stats['total_near_misses'] += 1
                         wave_stats['wave_near_misses'] += 1
                         score += 50
@@ -3946,38 +4660,99 @@ def main() -> None:
                 iframe_timer,
             ) = _pull_runtime_scalars(state)
 
-            # ── Draw player: idle pose or upward shooting pose ───────────────────────────
-            current_sprite_image = sprite_shoot_image if shoot_pose_timer > 0 else sprite_idle_image
-            current_pose_key = "shoot" if shoot_pose_timer > 0 else "idle"
+            # Sync list state back — systems rebuild these via assignment, not in-place mutation.
+            enemies        = state.enemies
+            fireballs      = state.fireballs
+            side_bullets   = state.side_bullets
+            enemy_bullets  = state.enemy_bullets
+            aimed_bullets  = state.aimed_bullets
+            boss_bullets   = state.boss_bullets
+            boss_minions   = state.boss_minions
+            health_pickups = state.health_pickups
+            sativa_pickups = state.sativa_pickups
+            data_souls     = state.data_souls
 
-            if iframe_timer == 0 or iframe_timer % 8 < 4:
-                if beat_pulse > 0 or sativa_active:
-                    _bp_t    = beat_pulse / BEAT_PULSE_FRAMES if beat_pulse > 0 else 1.0
-                    _scale_m = 0.45 if sativa_active else 0.18
-                    _bp_s    = 1.0 + _scale_m * _bp_t
-                    # Cache scaled sprite by BOTH pose and size.
-                    _bp_key  = (current_pose_key, round(_bp_s * 50) / 50)
-                    _bp_w    = int(sprite_rect.width  * _bp_key[1])
-                    _bp_h    = int(sprite_rect.height * _bp_key[1])
-                    if _scale_cache['key'] != _bp_key:
-                        _scale_cache['key']  = _bp_key
-                        _scale_cache['surf'] = pygame.transform.scale(current_sprite_image, (_bp_w, _bp_h))
-                    _bp_img  = _scale_cache['surf']
-                    _bp_r    = _bp_img.get_rect(center=sprite_rect.center)
-                    # glow ring
-                    _glow_m  = 1.4 if sativa_active else 0.6
-                    _glow_r  = int(sprite_rect.width * _glow_m * max(_bp_t, 0.4 if sativa_active else 0))
-                    if _glow_r > 2:
-                        _gcol   = (0, 255, 120) if sativa_active else (255, 200, 0)
-                        _glow_a = int((220 if sativa_active else 180) * max(_bp_t, 0.5 if sativa_active else 0))
-                        _sprite_glow_surf.fill((0, 0, 0, 0))
-                        pygame.draw.circle(_sprite_glow_surf, (*_gcol, _glow_a),
-                                           (120, 120), _glow_r)
-                        screen.blit(_sprite_glow_surf,
-                                    (_bp_r.centerx - 120, _bp_r.centery - 120))
-                    screen.blit(_bp_img, _bp_r)
-                else:
-                    screen.blit(current_sprite_image, sprite_rect)
+            # ── Draw player: running, directional shooting, hit, and flight animations ──
+            current_sprite_image, current_pose_key, player_render_offset = player_animator.get_frame(
+                player_velocity,
+                shoot_pose_timer > 0,
+                side_shoot_pose_timer > 0,
+                side_shot_direction,
+                hit_flash_timer > 0,
+                frame_count,
+            )
+            player_render_center = (
+                sprite_rect.centerx + player_render_offset[0],
+                sprite_rect.centery + player_render_offset[1],
+            )
+
+            # ── Loop ambient player movement sounds ──────────────────────────
+            _pose_state = current_pose_key.split(':')[0]
+            if run_sound:
+                if _pose_state.startswith('run_'):
+                    if not run_channel.get_busy():
+                        run_channel.play(run_sound, loops=-1)
+                elif run_channel.get_busy():
+                    run_channel.stop()
+            if jetpack_sound:
+                if _pose_state.startswith('fly_'):
+                    if not jetpack_channel.get_busy():
+                        jetpack_channel.play(jetpack_sound, loops=-1)
+                elif jetpack_channel.get_busy():
+                    jetpack_channel.stop()
+
+            # ── Landing impact: dust burst + thud when jetpack → ground ─────
+            if _prev_pose_state.startswith('fly_') and not _pose_state.startswith('fly_'):
+                _foot_x = float(sprite_rect.centerx)
+                _foot_y = float(sprite_rect.bottom - 4)
+                _dust_cols = [
+                    (210, 200, 180), (190, 185, 165),
+                    (170, 165, 145), (200, 190, 170), (180, 172, 155),
+                ]
+                for _ in range(5):
+                    particles.append({
+                        'x': _foot_x + random.randint(-14, 14),
+                        'y': _foot_y,
+                        'vx': random.uniform(-3.5, 3.5),
+                        'vy': random.uniform(-2.5, -0.6),
+                        'life': random.randint(16, 26),
+                        'max': 26,
+                        'color': random.choice(_dust_cols),
+                    })
+                if landing_sound:
+                    landing_sound.play()
+            _prev_pose_state = _pose_state
+
+            # Invulnerability frames still prevent repeat damage, but never hide
+            # the player sprite. This keeps the character readable during combat.
+            if beat_pulse > 0 or sativa_active:
+                _bp_t    = beat_pulse / BEAT_PULSE_FRAMES if beat_pulse > 0 else 1.0
+                _scale_m = 0.45 if sativa_active else 0.18
+                _bp_s    = 1.0 + _scale_m * _bp_t
+                # Cache scaled sprite by BOTH pose and size.
+                _bp_key  = (current_pose_key, round(_bp_s * 50) / 50)
+                _bp_w    = int(current_sprite_image.get_width() * _bp_key[1])
+                _bp_h    = int(current_sprite_image.get_height() * _bp_key[1])
+                if _scale_cache['key'] != _bp_key:
+                    _scale_cache['key']  = _bp_key
+                    _scale_cache['surf'] = pygame.transform.scale(current_sprite_image, (_bp_w, _bp_h))
+                _bp_img  = _scale_cache['surf']
+                _bp_r    = _bp_img.get_rect(center=player_render_center)
+                # glow ring
+                _glow_m  = 1.4 if sativa_active else 0.6
+                _glow_r  = int(sprite_rect.width * _glow_m * max(_bp_t, 0.4 if sativa_active else 0))
+                if _glow_r > 2:
+                    _gcol   = (0, 255, 120) if sativa_active else (255, 200, 0)
+                    _glow_a = int((220 if sativa_active else 180) * max(_bp_t, 0.5 if sativa_active else 0))
+                    _sprite_glow_surf.fill((0, 0, 0, 0))
+                    pygame.draw.circle(_sprite_glow_surf, (*_gcol, _glow_a),
+                                       (120, 120), _glow_r)
+                    screen.blit(_sprite_glow_surf,
+                                (_bp_r.centerx - 120, _bp_r.centery - 120))
+                screen.blit(_bp_img, _bp_r)
+            else:
+                _player_render_rect = current_sprite_image.get_rect(center=player_render_center)
+                screen.blit(current_sprite_image, _player_render_rect)
 
             if ancestral_protection_charges > 0 and iframe_timer % 6 < 3:
                 _aura_rad = sprite_rect.width // 2 + 8 + (2 if not PHOTOSENSITIVE_SAFE_MODE else 0)
@@ -3994,13 +4769,28 @@ def main() -> None:
             else:
                 _fb_col = _COL_FIREBALL
             for f in fireballs:
+                # Trailing tail — dim color extends below (bullet travels up)
+                _fb_dim = (max(0, _fb_col[0]//4), max(0, _fb_col[1]//4), max(0, _fb_col[2]//4))
+                pygame.draw.rect(screen, _fb_dim, (f.x + 1, f.bottom - 2, 6, 10))
                 if _fb_col != _COL_FIREBALL:
                     _fb_glow_surf.fill((*_fb_col, 80))
                     screen.blit(_fb_glow_surf, (f.x - 4, f.y - 4))
+                # Main body
                 pygame.draw.rect(screen, _fb_col, f)
+                # White-yellow hot tip at leading edge (top)
+                pygame.draw.rect(screen, (255, 255, 180), (f.x + 2, f.top, 4, 5))
             for sb in side_bullets:
-                _sbc = (0, 220, 255) if not sativa_active else (0, 255, 180)
-                pygame.draw.rect(screen, _sbc, (int(sb['x']) - 8, int(sb['y']) - 4, 16, 8))
+                _sbc     = (0, 220, 255) if not sativa_active else (0, 255, 180)
+                _sbc_dim = (0, 65, 80)   if not sativa_active else (0, 70, 55)
+                bx, by   = int(sb['x']), int(sb['y'])
+                if sb['vx'] > 0:  # right-moving: tail left, tip right
+                    pygame.draw.rect(screen, _sbc_dim,        (bx - 20, by - 1, 12, 2))
+                    pygame.draw.rect(screen, _sbc,            (bx -  8, by - 2, 16, 4))
+                    pygame.draw.rect(screen, (255, 255, 200), (bx +  8, by - 1,  5, 2))
+                else:             # left-moving: tail right, tip left
+                    pygame.draw.rect(screen, _sbc_dim,        (bx +  9, by - 1, 12, 2))
+                    pygame.draw.rect(screen, _sbc,            (bx -  8, by - 2, 16, 4))
+                    pygame.draw.rect(screen, (255, 255, 200), (bx - 13, by - 1,  5, 2))
             for e in enemies:
                 if level >= 4:
                     _dimg = drone_images_level_4[id(e) % len(drone_images_level_4)]
@@ -4129,8 +4919,9 @@ def main() -> None:
             # Blit accumulated gore to screen
             screen.blit(blood_fx_surface, (0, 0))
 
-            next_particles = []
-            for p in particles:
+            i = 0
+            while i < len(particles):
+                p = particles[i]
                 p['x'] += p['vx']
                 p['y'] += p['vy']
                 p['life'] -= 1
@@ -4138,9 +4929,15 @@ def main() -> None:
                     sz = max(1, int(5 * p['life'] / p['max']))
                     pygame.draw.rect(screen, p['color'],
                                      (int(p['x']), int(p['y']), sz, sz))
-                    next_particles.append(p)
+                    i += 1
+                else:
+                    # O(1) in-place removal: overwrite slot with last item
+                    particles[i] = particles[-1]
+                    particles.pop()
+            # Safety cap — only triggers during extreme burst phases
+            if len(particles) > MAX_PARTICLES:
+                del particles[:len(particles) - MAX_PARTICLES]
             # Hard caps prevent worst-case frame spikes during dense boss phases.
-            particles = next_particles[-MAX_PARTICLES:]
             score_popups  = score_popups[-MAX_SCORE_POPUPS:]
             data_souls    = data_souls[-MAX_DATA_SOULS:]
             fireballs     = fireballs[-MAX_FIREBALLS:]
@@ -4188,8 +4985,9 @@ def main() -> None:
                 for b in boss_bullets:
                     pygame.draw.rect(screen, _COL_BBULLET, b)
 
-            next_popups = []
-            for pop in score_popups:
+            _spi = 0
+            while _spi < len(score_popups):
+                pop = score_popups[_spi]
                 pop['timer'] -= 1
                 pop['y']     -= 1
                 if pop['timer'] > 0:
@@ -4198,8 +4996,10 @@ def main() -> None:
                     alpha = int(255 * pop['timer'] / pop['max'])
                     pop['surf'].set_alpha(alpha)
                     screen.blit(pop['surf'], pop['surf'].get_rect(centerx=int(pop['x']), y=int(pop['y'])))
-                    next_popups.append(pop)
-            score_popups = next_popups
+                    _spi += 1
+                else:
+                    score_popups[_spi] = score_popups[-1]
+                    score_popups.pop()
 
             if _score_cache['val'] != score:
                 _score_cache['val'] = score
@@ -4221,6 +5021,12 @@ def main() -> None:
                 screen.blit(_wave_cache['surf'], _wave_cache['surf'].get_rect(centerx=WIDTH // 2, y=10))
             for i in range(8):
                 screen.blit(_heart_red_h if i < health else _heart_grey_h, (10 + i * 26, 40))
+            _bs_danger = block_signal < 25 and not game_over
+            if _bs_danger:
+                _bs_pulse = abs(math.sin(frame_count * 0.22))
+                _block_lbl_h.set_alpha(int(130 + 125 * _bs_pulse))
+            else:
+                _block_lbl_h.set_alpha(255)
             screen.blit(_block_lbl_h, (10, 70))
             _bs_bg = pygame.Rect(10, 96, 220, 14)
             _bs_ratio = (block_signal / block_signal_max) if block_signal_max else 0
@@ -4232,7 +5038,11 @@ def main() -> None:
                 _bs_col = (255, 70, 70)
             pygame.draw.rect(screen, (20, 35, 45), _bs_bg)
             pygame.draw.rect(screen, _bs_col, (_bs_bg.x, _bs_bg.y, int(_bs_bg.width * _bs_ratio), _bs_bg.height))
-            pygame.draw.rect(screen, (230, 230, 255), _bs_bg, 2)
+            if _bs_danger:
+                _bs_bdr = (255, int(60 * (1.0 - _bs_pulse)), int(60 * (1.0 - _bs_pulse)))
+                pygame.draw.rect(screen, _bs_bdr, _bs_bg.inflate(2, 2), 3)
+            else:
+                pygame.draw.rect(screen, (230, 230, 255), _bs_bg, 2)
             _bs_pct = int(_bs_ratio * 100)
             if _block_pct_cache['val'] != _bs_pct or _block_pct_cache['col'] != _bs_col:
                 _block_pct_cache['val'] = _bs_pct
@@ -4256,8 +5066,11 @@ def main() -> None:
                 _signal_pct_cache['surf'] = font.render(f'{_sig_pct}%', True, _sig_col)
             screen.blit(_signal_pct_cache['surf'], _signal_pct_cache['surf'].get_rect(left=238, centery=_sig_bg.centery))
             if ancestral_protection_charges > 0:
-                _ap_guard = font.render(f'ANCESTRAL GUARD x{ancestral_protection_charges}', True, (170, 255, 220))
-                screen.blit(_ap_guard, (_sig_bg.x, _sig_bg.bottom + 6))
+                if _ap_guard_cache['val'] != ancestral_protection_charges:
+                    _ap_guard_cache['val']  = ancestral_protection_charges
+                    _ap_guard_cache['surf'] = font.render(
+                        f'ANCESTRAL GUARD x{ancestral_protection_charges}', True, (170, 255, 220))
+                screen.blit(_ap_guard_cache['surf'], (_sig_bg.x, _sig_bg.bottom + 6))
             if active_perks:
                 _ap_key = "  ·  ".join(active_perks)
                 if _perks_cache['val'] != _ap_key:

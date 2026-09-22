@@ -1,0 +1,15 @@
+# OnyxG Replay Action Log
+# frame|event|payload
+0|run_start|difficulty=normal;max_continues=2
+4893|signal_burst|points=600
+6717|boss_defeated|level=1;wave=5
+6806|level_start|level=2
+12216|boss_defeated|level=2;wave=5
+12305|level_start|level=3
+13465|signal_burst|points=500
+17679|boss_defeated|level=3;wave=5
+17768|level_start|level=4
+18945|signal_burst|points=1000
+21911|signal_burst|points=0
+22574|boss_defeated|level=4;wave=5
+22663|run_end|score=35600;won=1;game_over=0;continues=0
