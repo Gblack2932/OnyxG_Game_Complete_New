@@ -1,29 +1,33 @@
-# Onyx G vs. Space Invaders 🎮
+# Onyx G vs Space Drones 🎮
 
-A custom Python/Pygame arcade game inspired by the classic Space Invaders formula and built around the original character **Onyx G**.
+A custom Python/Pygame arcade shooter built around the original character **Onyx G**, inspired by classic arcade shooters and expanded with original gameplay systems, visuals, progression, and presentation.
 
-This project represents my work in game programming, gameplay systems, UI design, debugging, iteration, and asset integration.
+This project demonstrates my work in game programming, gameplay systems, UI design, debugging, iteration, asset integration, and version control.
 
 ## About the Game
 
-**Onyx G vs. Space Invaders** reimagines the classic arcade shooter through my own creative universe.
+**Onyx G vs Space Drones** is a multi-level arcade shooter set in the Ghetto Geekz universe.
 
-The project combines traditional arcade gameplay with original visuals, characters, menus, scoring systems, win/lose states, and custom presentation.
+Players control Onyx G through escalating waves of enemies while protecting the Block Signal, collecting power-ups, building combos, and surviving increasingly difficult encounters.
 
 ## Features
 
 - Original Onyx G character integration
-- Arcade-style enemy encounters
-- Player movement and shooting systems
-- Score tracking
-- Start menu
-- Win and game-over screens
+- Multi-level arcade gameplay
+- Enemy waves and boss encounters
+- Player movement, shooting, and dash systems
+- Score and combo tracking
+- Block Signal objective system
+- Signal Burst mechanic
+- Power-ups including Rapid Fire, Shield, and Spread Shot
+- Start menu and tutorial screen
+- Win and game-over states
 - Replay functionality
-- Custom graphics and visual assets
+- Custom graphics, audio, and visual assets
 - Game-session/action logging
 - Collision detection
-- Python/Pygame gameplay systems
-- Multiple rounds of testing, debugging, and UI refinement
+- UI refinement and accessibility considerations
+- Multiple rounds of testing and debugging
 
 ## Built With
 
@@ -41,3 +45,41 @@ The project combines traditional arcade gameplay with original visuals, characte
 
 ```bash
 pip install pygame
+```
+
+4. From the project folder, run:
+
+```bash
+python main.py
+```
+
+## Controls
+
+- **Arrow Keys** — Move
+- **Space** — Shoot
+- **Shift** — Dash
+- **ESC / Backspace** — Return to menu
+
+## Objective
+
+Protect the **Block Signal**, defeat enemy waves, collect power-ups, build combos, and survive through the later stages and boss encounters.
+
+## Project Status
+
+**Playable Build**
+
+The repository contains the working game build, source code, development history, and supporting assets.
+
+## Developer
+
+**Gary Black**  
+Game Design & Development
+
+## Portfolio Note
+
+This project demonstrates continued development in Python programming, gameplay systems, debugging, version control, UI implementation, interactive media development, and iterative game design.
+
+---
+
+**Onyx G vs Space Drones**  
+Original game project by Gary Black.
