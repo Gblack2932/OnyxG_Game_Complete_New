@@ -1333,6 +1333,159 @@ def _start_menu(screen, clock, menu_img, menu_music_file=None,
         clock.tick(60)
 
 
+def _pause_menu(screen: pygame.Surface, clock: pygame.time.Clock,
+                frozen_frame: pygame.Surface,
+                tutorial_img=None) -> str:
+    """Display a modal pause menu and return the requested game action.
+
+    Gameplay remains frozen while this menu owns the event loop. Music and
+    active sound channels are paused on entry and restored only when resuming.
+    """
+    W, H = screen.get_size()
+    options = [
+        ("RESUME", "resume"),
+        ("RESTART RUN", "restart"),
+        ("HOW TO PLAY", "tutorial"),
+        ("MAIN MENU", "menu"),
+        ("QUIT GAME", "quit"),
+    ]
+    selected = 0
+
+    overlay = pygame.Surface((W, H), pygame.SRCALPHA)
+    overlay.fill((0, 0, 20, 205))
+    panel = pygame.Rect(int(W * 0.16), int(H * 0.16), int(W * 0.68), int(H * 0.68))
+
+    title_font = _get_arcade_font(max(28, min(46, int(H * 0.052))))
+    button_font = _get_arcade_font(max(14, min(20, int(H * 0.022))))
+    hint_font = pygame.font.SysFont("Arial", max(18, min(24, int(H * 0.026))), bold=True)
+
+    btn_w = int(panel.width * 0.72)
+    btn_h = max(48, min(62, int(panel.height * 0.105)))
+    btn_gap = max(10, int(btn_h * 0.24))
+    total_h = btn_h * len(options) + btn_gap * (len(options) - 1)
+    start_y = panel.centery - total_h // 2 + 20
+    btn_x = panel.centerx - btn_w // 2
+    rects = [
+        pygame.Rect(btn_x, start_y + i * (btn_h + btn_gap), btn_w, btn_h)
+        for i in range(len(options))
+    ]
+
+    try:
+        pygame.mixer.pause()
+        pygame.mixer.music.pause()
+    except pygame.error:
+        pass
+
+    def _resume_audio() -> None:
+        try:
+            pygame.mixer.unpause()
+            pygame.mixer.music.unpause()
+        except pygame.error:
+            pass
+
+    def _stop_audio() -> None:
+        try:
+            pygame.mixer.unpause()
+            pygame.mixer.stop()
+            pygame.mixer.music.stop()
+        except pygame.error:
+            pass
+
+    while True:
+        screen.blit(frozen_frame, (0, 0))
+        screen.blit(overlay, (0, 0))
+        pygame.draw.rect(screen, (12, 10, 30), panel, border_radius=18)
+        pygame.draw.rect(screen, (120, 80, 210), panel, 3, border_radius=18)
+
+        title = title_font.render("PAUSED", True, (245, 245, 255))
+        screen.blit(title, title.get_rect(center=(panel.centerx, panel.top + 58)))
+
+        mx, my = pygame.mouse.get_pos()
+        hovered = next((i for i, rect in enumerate(rects) if rect.collidepoint(mx, my)), None)
+        if hovered is not None:
+            selected = hovered
+
+        for i, ((label, _), rect) in enumerate(zip(options, rects)):
+            active = (i == selected)
+            fill = (64, 48, 105) if active else (24, 20, 48)
+            border = (245, 210, 80) if active else (105, 78, 165)
+            text_color = (255, 240, 170) if active else (220, 210, 240)
+            pygame.draw.rect(screen, fill, rect, border_radius=8)
+            pygame.draw.rect(screen, border, rect, 2, border_radius=8)
+            label_surf = button_font.render(label, True, text_color)
+            screen.blit(label_surf, label_surf.get_rect(center=rect.center))
+
+        hint = hint_font.render(
+            "UP/DOWN + ENTER   •   ESC/B = RESUME",
+            True,
+            (185, 195, 225),
+        )
+        screen.blit(hint, hint.get_rect(center=(panel.centerx, panel.bottom - 34)))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+        requested = None
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                requested = "quit"
+                break
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    requested = "resume"
+                    break
+                if event.key in (pygame.K_UP, pygame.K_w):
+                    selected = (selected - 1) % len(options)
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    selected = (selected + 1) % len(options)
+                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    requested = options[selected][1]
+                    break
+
+            elif event.type == pygame.JOYHATMOTION:
+                if event.value[1] > 0:
+                    selected = (selected - 1) % len(options)
+                elif event.value[1] < 0:
+                    selected = (selected + 1) % len(options)
+
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button in (1, 7):  # B or Start
+                    requested = "resume"
+                    break
+                if event.button == 0:  # A
+                    requested = options[selected][1]
+                    break
+                if event.button == 11:
+                    selected = (selected - 1) % len(options)
+                elif event.button == 12:
+                    selected = (selected + 1) % len(options)
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for i, rect in enumerate(rects):
+                    if rect.collidepoint(event.pos):
+                        selected = i
+                        requested = options[i][1]
+                        break
+                if requested is not None:
+                    break
+
+        if requested is None:
+            continue
+
+        if requested == "tutorial":
+            if tutorial_img is not None:
+                _tutorial_screen(screen, clock, tutorial_img, None)
+            continue
+
+        if requested == "resume":
+            _resume_audio()
+            return "resume"
+
+        _stop_audio()
+        return requested
+
+
 def _boss_intro_cinematic(screen: pygame.Surface, clock: pygame.time.Clock) -> None:
     """
     Display dramatic boss entrance cinematic sequence.
@@ -3096,8 +3249,9 @@ def main() -> None:
             'wave_near_misses': 0,
             'wave_signal_bursts': 0,
         }
-        paused             = False
-        beat_pulse            = 0
+        pause_snapshot     = screen.copy()
+        pause_exit_action  = None
+        beat_pulse         = 0
         swarm_active          = False
         swarm_timer           = 0
         swarm_msg_timer       = 0
@@ -3735,7 +3889,7 @@ def main() -> None:
                     elif continues_used >= max_continues:
                         running = False
                         continue_timer = 0
-                # ── Pause toggle (ESC  or  Start/B) ───────────────────────
+                # ── Pause menu (ESC  or  Start/B) ─────────────────────────
                 _toggle_pause = (
                     event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                 ) or (
@@ -3743,7 +3897,32 @@ def main() -> None:
                     and _joy is not None and event.button in (1, 7)  # B or Start
                 )
                 if _toggle_pause and not show_upgrade and continue_timer == 0:
-                    paused = not paused
+                    append_replay_event(replay_events, frame_count, 'pause_open')
+                    _pause_action = _pause_menu(
+                        screen,
+                        clock,
+                        pause_snapshot if pause_snapshot is not None else screen.copy(),
+                        tutorial_img=tutorial_img,
+                    )
+                    append_replay_event(
+                        replay_events,
+                        frame_count,
+                        'pause_action',
+                        f'action={_pause_action}',
+                    )
+                    if _pause_action == "restart":
+                        pause_exit_action = "restart"
+                        restart = True
+                        running = False
+                        break
+                    if _pause_action == "menu":
+                        pause_exit_action = "menu"
+                        restart = True
+                        running = False
+                        break
+                    if _pause_action == "quit":
+                        pygame.quit()
+                        sys.exit()
                 # ── Signal burst (LSHIFT  or  LB) ─────────────────────────
                 _do_burst = (
                     event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT
@@ -3752,7 +3931,7 @@ def main() -> None:
                     and _joy is not None and event.button == 4  # LB
                 )
                 if (_do_burst and signal_meter >= signal_max and not show_upgrade
-                        and continue_timer == 0 and not paused):
+                        and continue_timer == 0):
                     signal_burst_center = sprite_rect.center
                     enemy_bullets.clear()
                     aimed_bullets.clear()
@@ -3822,6 +4001,9 @@ def main() -> None:
                         sativa_dropped = False
                         wave_intro_timer = 120
 
+            if not running:
+                break
+
             if game_over and continue_timer > 0:
                 frame_count += 1
                 continue_timer -= 1
@@ -3881,16 +4063,6 @@ def main() -> None:
                     screen.blit(_gop, _gop.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 135)))
                 if continue_timer <= 0:
                     running = False
-                pygame.display.flip()
-                clock.tick(60)
-                continue
-
-            if paused:
-                screen.blit(_pov_surf, (0, 0))
-                _pt = font_big.render("PAUSED", True, (255, 255, 255))
-                screen.blit(_pt, _pt.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 40)))
-                _ph = font_med.render("Press  ESC  to resume", True, (180, 200, 255))
-                screen.blit(_ph, _ph.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 20)))
                 pygame.display.flip()
                 clock.tick(60)
                 continue
@@ -5375,6 +5547,7 @@ def main() -> None:
                 screen.blit(_chroma_cyan, ( _coff, 0))
             # ── CRT scanlines (always on top) ──────────────────────────────
             screen.blit(scanline_surf, (0, 0))
+            pause_snapshot = screen.copy()
             pygame.display.flip()
             raw_dt = clock.tick(60)
             if frame_count % 30 == 0:
@@ -5391,6 +5564,28 @@ def main() -> None:
             save_replay_log(replay_log_path, replay_events)
         except Exception as err:
             print(f"Warning: replay log save failed: {err}")
+
+        # Pause-menu restart/menu exits intentionally bypass score submission
+        # and the win/lose results screen.
+        if pause_exit_action in ("restart", "menu"):
+            if pause_exit_action == "menu":
+                _start_menu(
+                    screen,
+                    clock,
+                    menu_img,
+                    start_menu_music_file,
+                    tutorial_img=tutorial_img,
+                    tutorial_music_file=tutorial_music_file,
+                )
+            if music_file:
+                try:
+                    pygame.mixer.music.load(music_file)
+                    pygame.mixer.music.set_volume(0.7)
+                    pygame.mixer.music.play(-1)
+                    current_bgm_tag = "level1"
+                except pygame.error:
+                    pass
+            continue
 
         # ── Save high score (top 3) ──────────────────────────────────────────────
         _earned_place = None
