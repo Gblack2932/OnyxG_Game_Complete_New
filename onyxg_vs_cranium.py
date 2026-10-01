@@ -2709,9 +2709,10 @@ def main() -> None:
         combo_sounds = []
         print(f"⚠️ Combo sounds disabled: {err}")
 
-    font     = pygame.font.SysFont("Arial", 24)
-    font_big = pygame.font.SysFont("Arial", 64, bold=True)
-    font_med = pygame.font.SysFont("Arial", 36)
+    font       = pygame.font.SysFont("Arial", 24)
+    font_small = pygame.font.SysFont("Arial", 18, bold=True)
+    font_big   = pygame.font.SysFont("Arial", 64, bold=True)
+    font_med   = pygame.font.SysFont("Arial", 36)
     font_popup = pygame.font.SysFont("Arial", 22, bold=True)
     font_huge = pygame.font.SysFont("Arial", 120, bold=True)
 
@@ -2759,11 +2760,15 @@ def main() -> None:
     _boss_tint_surf   = pygame.Surface((100, 100), pygame.SRCALPHA)
     _sprite_glow_surf = pygame.Surface((240, 240), pygame.SRCALPHA)
     # Pre-rendered HUD surfaces (static text — rendered once, blitted every frame)
-    _heart_red_h  = font.render("\u2665", True, _COL_RED)
-    _heart_grey_h = font.render("\u2665", True, (70, 70, 70))
-    _block_lbl_h  = font.render('BLOCK SIGNAL', True, (180, 220, 255))
-    _signal_lbl_h = font.render('SIGNAL BURST', True, (190, 120, 255))
-    _sativa_lbl_h = font.render('\u2605 HYDRATED', True, (70, 180, 255))
+    _hud_panel = pygame.Surface((WIDTH, 178), pygame.SRCALPHA)
+    _hud_panel.fill((4, 10, 18, 150))
+    pygame.draw.line(_hud_panel, (70, 170, 220, 120), (0, 177), (WIDTH, 177), 1)
+    _heart_red_h  = font_small.render("\u2665", True, _COL_RED)
+    _heart_grey_h = font_small.render("\u2665", True, (70, 70, 70))
+    _block_lbl_h  = font_small.render('BLOCK SIGNAL', True, (180, 220, 255))
+    _signal_lbl_h = font_small.render('SIGNAL BURST', True, (190, 120, 255))
+    _trauma_tag_h = font_small.render('TRAUMA', True, (255, 95, 95))
+    _sativa_lbl_h = font_small.render('\u2605 HYDRATED', True, (70, 180, 255))
     _shake_surf   = pygame.Surface((WIDTH, HEIGHT))  # no SRCALPHA; plain pixel copy
     # Dirty caches for text that rarely changes
     _score_cache = {'val': -1, 'surf': None}
@@ -5180,34 +5185,47 @@ def main() -> None:
                     score_popups[_spi] = score_popups[-1]
                     score_popups.pop()
 
+            # ── Compact gameplay HUD ────────────────────────────────────────
+            screen.blit(_hud_panel, (0, 0))
             if _score_cache['val'] != score:
                 _score_cache['val'] = score
-                _score_cache['surf'] = font.render(f"Score: {score}", True, _COL_WHITE)
-            screen.blit(_score_cache['surf'], (10, 10))
+                _score_cache['surf'] = font_small.render(f"SCORE {score:,}", True, _COL_WHITE)
+            screen.blit(_score_cache['surf'], (10, 8))
+
             _hs_key = f"{leaderboard_label}:{high_score_name}{high_score}"
             if _hs_cache['val'] != _hs_key:
                 _hs_cache['val'] = _hs_key
-                _hs_cache['surf'] = font.render(
-                    f"Best ({leaderboard_label}): {high_score_name}  {high_score:,}",
+                _hs_cache['surf'] = font_small.render(
+                    f"BEST {leaderboard_label}  {high_score_name}  {high_score:,}",
                     True,
-                    (180, 180, 180),
+                    (185, 190, 200),
                 )
-            screen.blit(_hs_cache['surf'], _hs_cache['surf'].get_rect(right=WIDTH - 10, y=10))
+            screen.blit(_hs_cache['surf'], _hs_cache['surf'].get_rect(right=WIDTH - 10, y=8))
+
             if not boss_active and not boss_warned and not boss_defeated:
                 if _wave_cache['val'] != (level, wave):
                     _wave_cache['val'] = (level, wave)
-                    _wave_cache['surf'] = font.render(f"LEVEL {level}  WAVE {wave} / 5", True, (150, 200, 255))
-                screen.blit(_wave_cache['surf'], _wave_cache['surf'].get_rect(centerx=WIDTH // 2, y=10))
+                    _wave_cache['surf'] = font_small.render(
+                        f"LEVEL {level}  •  WAVE {wave}/5", True, (150, 205, 255))
+                screen.blit(_wave_cache['surf'], _wave_cache['surf'].get_rect(centerx=WIDTH // 2, y=8))
+
             for i in range(8):
-                screen.blit(_heart_red_h if i < health else _heart_grey_h, (10 + i * 26, 40))
+                screen.blit(_heart_red_h if i < health else _heart_grey_h, (10 + i * 22, 35))
+
+            if trauma_mode:
+                _tag_bg = pygame.Rect(WIDTH - 100, 34, 90, 24)
+                pygame.draw.rect(screen, (70, 10, 18, 190), _tag_bg, border_radius=5)
+                pygame.draw.rect(screen, (255, 95, 95), _tag_bg, 1, border_radius=5)
+                screen.blit(_trauma_tag_h, _trauma_tag_h.get_rect(center=_tag_bg.center))
+
             _bs_danger = block_signal < 25 and not game_over
             if _bs_danger:
                 _bs_pulse = abs(math.sin(frame_count * 0.22))
                 _block_lbl_h.set_alpha(int(130 + 125 * _bs_pulse))
             else:
                 _block_lbl_h.set_alpha(255)
-            screen.blit(_block_lbl_h, (10, 70))
-            _bs_bg = pygame.Rect(10, 96, 220, 14)
+            screen.blit(_block_lbl_h, (10, 62))
+            _bs_bg = pygame.Rect(10, 84, 200, 12)
             _bs_ratio = (block_signal / block_signal_max) if block_signal_max else 0
             if _bs_ratio > 0.6:
                 _bs_col = (40, 235, 90)
@@ -5221,20 +5239,18 @@ def main() -> None:
                 _bs_bdr = (255, int(60 * (1.0 - _bs_pulse)), int(60 * (1.0 - _bs_pulse)))
                 pygame.draw.rect(screen, _bs_bdr, _bs_bg.inflate(2, 2), 3)
             else:
-                pygame.draw.rect(screen, (230, 230, 255), _bs_bg, 2)
+                pygame.draw.rect(screen, (230, 230, 255), _bs_bg, 1)
             _bs_pct = int(_bs_ratio * 100)
             if _block_pct_cache['val'] != _bs_pct or _block_pct_cache['col'] != _bs_col:
                 _block_pct_cache['val'] = _bs_pct
                 _block_pct_cache['col'] = _bs_col
-                _block_pct_cache['surf'] = font.render(f"{_bs_pct}%", True, _bs_col)
-            screen.blit(_block_pct_cache['surf'], (_bs_bg.right + 8, _bs_bg.y - 5))
-            screen.blit(_signal_lbl_h, (10, 118))
-            _sig_bg = pygame.Rect(10, 144, 220, 14)
+                _block_pct_cache['surf'] = font_small.render(f"{_bs_pct}%", True, _bs_col)
+            screen.blit(_block_pct_cache['surf'], (_bs_bg.right + 8, _bs_bg.y - 4))
+
+            screen.blit(_signal_lbl_h, (10, 105))
+            _sig_bg = pygame.Rect(10, 127, 200, 12)
             _sig_ratio = (signal_meter / signal_max) if signal_max else 0
-            if signal_meter >= signal_max:
-                _sig_col = (255, 220, 60)
-            else:
-                _sig_col = (180, 80, 255)
+            _sig_col = (255, 220, 60) if signal_meter >= signal_max else (180, 80, 255)
             pygame.draw.rect(screen, (30, 20, 45), _sig_bg)
             pygame.draw.rect(screen, _sig_col, (_sig_bg.x, _sig_bg.y, int(_sig_bg.width * _sig_ratio), _sig_bg.height))
             pygame.draw.rect(screen, (230, 230, 255), _sig_bg, 1)
@@ -5242,25 +5258,34 @@ def main() -> None:
             _sig_key = (_sig_pct, _sig_col)
             if _signal_pct_cache['val'] != _sig_key:
                 _signal_pct_cache['val'] = _sig_key
-                _signal_pct_cache['surf'] = font.render(f'{_sig_pct}%', True, _sig_col)
-            screen.blit(_signal_pct_cache['surf'], _signal_pct_cache['surf'].get_rect(left=238, centery=_sig_bg.centery))
+                _signal_pct_cache['surf'] = font_small.render(f'{_sig_pct}%', True, _sig_col)
+            screen.blit(_signal_pct_cache['surf'],
+                        _signal_pct_cache['surf'].get_rect(left=218, centery=_sig_bg.centery))
+
             if ancestral_protection_charges > 0:
                 if _ap_guard_cache['val'] != ancestral_protection_charges:
-                    _ap_guard_cache['val']  = ancestral_protection_charges
-                    _ap_guard_cache['surf'] = font.render(
+                    _ap_guard_cache['val'] = ancestral_protection_charges
+                    _ap_guard_cache['surf'] = font_small.render(
                         f'ANCESTRAL GUARD x{ancestral_protection_charges}', True, (170, 255, 220))
-                screen.blit(_ap_guard_cache['surf'], (_sig_bg.x, _sig_bg.bottom + 6))
+                screen.blit(_ap_guard_cache['surf'], (10, 148))
+
             if active_perks:
-                _ap_key = "  ·  ".join(active_perks)
+                _perk_short = [p.split()[0].upper() for p in active_perks[-5:]]
+                _ap_key = "  •  ".join(_perk_short)
                 if _perks_cache['val'] != _ap_key:
                     _perks_cache['val'] = _ap_key
-                    _perks_cache['surf'] = font.render(_ap_key, True, (180, 120, 255))
-                screen.blit(_perks_cache['surf'], _perks_cache['surf'].get_rect(centerx=WIDTH // 2, y=HEIGHT - 30))
+                    _perks_cache['surf'] = font_small.render(_ap_key, True, (190, 130, 255))
+                _perk_bg = pygame.Rect(0, HEIGHT - 30, WIDTH, 30)
+                pygame.draw.rect(screen, (4, 10, 18, 165), _perk_bg)
+                screen.blit(_perks_cache['surf'],
+                            _perks_cache['surf'].get_rect(centerx=WIDTH // 2, centery=HEIGHT - 15))
+
             if sativa_active:
-                _sv_w = int((sativa_timer / 600) * 200)
-                pygame.draw.rect(screen, (0, 80, 40),  (WIDTH - 220, HEIGHT - 24, 200, 14))
-                pygame.draw.rect(screen, (0, 255, 120), (WIDTH - 220, HEIGHT - 24, _sv_w, 14))
-                screen.blit(_sativa_lbl_h, _sativa_lbl_h.get_rect(right=WIDTH - 224, centery=HEIGHT - 17))
+                _sv_w = int((sativa_timer / 600) * 150)
+                pygame.draw.rect(screen, (0, 80, 40), (WIDTH - 170, HEIGHT - 20, 150, 10))
+                pygame.draw.rect(screen, (0, 255, 120), (WIDTH - 170, HEIGHT - 20, _sv_w, 10))
+                screen.blit(_sativa_lbl_h,
+                            _sativa_lbl_h.get_rect(right=WIDTH - 176, centery=HEIGHT - 15))
             if combo > 1 and combo_timer > 0:
                 alpha = min(255, combo_timer * 4)
                 if _combo_cache['val'] != combo:
@@ -5467,14 +5492,8 @@ def main() -> None:
                 _swarm_text_surf.set_alpha(_swa)
                 screen.blit(_swarm_text_surf, _swarm_text_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 110)))
 
-            if trauma_mode:
-                if PHOTOSENSITIVE_SAFE_MODE:
-                    _trauma_text_surf.set_alpha(90)
-                    screen.blit(_trauma_text_surf, _trauma_text_surf.get_rect(center=(WIDTH // 2, 84)))
-                elif frame_count % 180 < 40:
-                    _taa = int(255 * (1.0 - abs(20 - (frame_count % 40)) / 20))
-                    _trauma_text_surf.set_alpha(_taa)
-                    screen.blit(_trauma_text_surf, _trauma_text_surf.get_rect(center=(WIDTH // 2, 84)))
+            # TRAUMA status now lives in the compact HUD tag above.
+            # Keep the large flashing banner reserved for the Level 2 intro only.
 
             if boss_defeat_timer > 0:
                 boss_defeat_timer -= 1
