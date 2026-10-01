@@ -511,8 +511,8 @@ class PlayerSpriteAnimator:
     Priority: LeftAnimatons.png + RightAnimations.png > FlyLeftAndRight.png > transform fallback.
     """
 
-    _RUN_CYCLE_FRAMES       = 4   # game frames per keyframe — run
-    _RUN_SHOOT_CYCLE_FRAMES = 3   # faster during run + shoot
+    _RUN_CYCLE_FRAMES       = 6   # game frames per keyframe — clearer leg cadence
+    _RUN_SHOOT_CYCLE_FRAMES = 5   # readable stride while firing
     _FLY_CYCLE_FRAMES       = 5   # hover cycle
     _FLY_SHOOT_CYCLE_FRAMES = 4   # fly + shoot
     _SHOOT_CYCLE_FRAMES     = 3   # upward / hit flash
@@ -813,17 +813,23 @@ class PlayerSpriteAnimator:
                 for key, frames in self._frames.items()
             }
             # Tiny animation-only grounding tweaks.
+            # Stronger grounded cadence so the leg poses read clearly at game scale.
+            _run_bob_r = ((2, 4), (1, -2), (0, 3), (2, -3), (1, 2))
+            _run_bob_l = tuple((-x, y) for x, y in _run_bob_r)
             self._frame_offsets['run_right'] = tuple(
-                ((1, 2) if i % 2 == 0 else (0, -1)) for i in range(len(rr_f))
+                _run_bob_r[i % len(_run_bob_r)] for i in range(len(rr_f))
             )
             self._frame_offsets['run_left'] = tuple(
-                ((-1, 2) if i % 2 == 0 else (0, -1)) for i in range(len(rl_f))
+                _run_bob_l[i % len(_run_bob_l)] for i in range(len(rl_f))
             )
+
+            _shoot_bob_r = ((2, 3), (1, -2), (0, 3), (2, -2))
+            _shoot_bob_l = tuple((-x, y) for x, y in _shoot_bob_r)
             self._frame_offsets['run_shoot_right'] = tuple(
-                ((1, 1) if i % 2 == 0 else (0, -1)) for i in range(len(rsr_f))
+                _shoot_bob_r[i % len(_shoot_bob_r)] for i in range(len(rsr_f))
             )
             self._frame_offsets['run_shoot_left'] = tuple(
-                ((-1, 1) if i % 2 == 0 else (0, -1)) for i in range(len(rsl_f))
+                _shoot_bob_l[i % len(_shoot_bob_l)] for i in range(len(rsl_f))
             )
         elif lsheet is not None and rsheet is not None:
             # New sheets: 5/8/8/6/8/8/7 frame counts
