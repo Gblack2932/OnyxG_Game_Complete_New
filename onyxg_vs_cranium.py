@@ -511,8 +511,8 @@ class PlayerSpriteAnimator:
     Priority: LeftAnimatons.png + RightAnimations.png > FlyLeftAndRight.png > transform fallback.
     """
 
-    _RUN_CYCLE_FRAMES       = 6   # game frames per keyframe — clearer leg cadence
-    _RUN_SHOOT_CYCLE_FRAMES = 5   # readable stride while firing
+    _RUN_CYCLE_FRAMES       = 7   # deliberate four-step stride
+    _RUN_SHOOT_CYCLE_FRAMES = 6   # readable stride while firing
     _FLY_CYCLE_FRAMES       = 5   # hover cycle
     _FLY_SHOOT_CYCLE_FRAMES = 4   # fly + shoot
     _SHOOT_CYCLE_FRAMES     = 3   # upward / hit flash
@@ -540,14 +540,18 @@ class PlayerSpriteAnimator:
             return pygame.transform.scale(rotated, (rw, max(1, int(rh * yscale))))
 
         # ── Target sizes ────────────────────────────────────────────────────
-        STAND = cfg.PLAYER_SIZE                                      # (80, 160)
+        STAND = cfg.PLAYER_SIZE                                      # legacy target
         FLY = (int(cfg.PLAYER_SIZE[0] * 2.0), int(cfg.PLAYER_SIZE[1] * 0.65))
+        # The generated gritty frames are much squarer than the legacy art.
+        # Give them a wider visual target while leaving the gameplay hitbox unchanged.
+        GRITTY_STAND = (112, 150)
+        GRITTY_FLY = (132, 118)
 
         if gritty_sheet is not None:
             # ── GRITTY ONYX G SHEET ─────────────────────────────────────────
             # Primary art source. Left-facing poses are mirrored from the
             # right-facing frames so one production sheet covers both directions.
-            def _cg(rects, tgt=STAND):
+            def _cg(rects, tgt=GRITTY_STAND):
                 _frames = _cut_sheet_frames(gritty_sheet, rects, tgt)
                 _fixed = []
 
@@ -576,10 +580,11 @@ class PlayerSpriteAnimator:
                 (18, 36, 122, 172),
                 (145, 36, 125, 172),
             ])
+            # Four strongest stride silhouettes. The middle generated frame is
+            # intentionally skipped because it reads too similarly at game scale.
             rr_f = _cg([
                 (300, 38, 168, 172),
                 (472, 36, 162, 172),
-                (628, 38, 158, 172),
                 (770, 38, 172, 172),
                 (934, 40, 174, 172),
             ])
@@ -606,7 +611,7 @@ class PlayerSpriteAnimator:
                 (12, 896, 142, 190),
                 (150, 898, 140, 190),
                 (294, 892, 140, 190),
-            ], FLY)
+            ], GRITTY_FLY)
             fl_f = tuple(pygame.transform.flip(f, True, False) for f in fr_f)
 
             # Jetpack shoot-right sequence, mirrored for left.
@@ -615,14 +620,14 @@ class PlayerSpriteAnimator:
                 (154, 1134, 226, 205),
                 (342, 1134, 224, 205),
                 (530, 1134, 224, 205),
-            ], FLY)
+            ], GRITTY_FLY)
             fsl_f = tuple(pygame.transform.flip(f, True, False) for f in fsr_f)
 
             # Jetpack upward-shoot sequence.
             fsu_r_f = _cg([
                 (758, 1124, 160, 266),
                 (922, 1124, 190, 266),
-            ], FLY)
+            ], GRITTY_FLY)
             fsu_l_f = tuple(pygame.transform.flip(f, True, False) for f in fsu_r_f)
 
             # Low/braced pose makes a clean hit reaction without changing hitbox.
