@@ -2489,7 +2489,14 @@ def main() -> None:
     )
     # Keep this name for existing rect init and fallback paths.
     sprite_image       = sprite_idle_image
-    drone_image    = load_image(dir_map, "drone_spaceship.png",   (40, 40))
+    # Level 1 art overhaul: prefer the new Cranium Scout sprite while
+    # keeping the original drone as a safe fallback during local sync/testing.
+    _level1_drone_asset = (
+        "cranium_scout.png"
+        if "cranium_scout.png" in dir_map
+        else "drone_spaceship.png"
+    )
+    drone_image = load_image(dir_map, _level1_drone_asset, (40, 40))
     drone_images_level_2 = load_drone_sheet_sprites(dir_map, "Drones Level 2 .png", (44, 44))
     drone_images_level_4 = load_level4_enemy_sprites(
         dir_map,
