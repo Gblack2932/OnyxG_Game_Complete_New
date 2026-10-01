@@ -892,15 +892,25 @@ class PlayerSpriteAnimator:
                 _run_bob_l[i % len(_run_bob_l)] for i in range(len(rl_f))
             )
 
-            # Moving fire shares the exact proven foot cadence with running.
+            # Moving fire keeps the proven foot cadence, with recoil layered
+            # only on alternating fire frames so the legs never freeze.
             self._frame_offsets['run_shoot_right'] = tuple(
-                _run_bob_r[i % len(_run_bob_r)] for i in range(len(rsr_f))
+                (
+                    _run_bob_r[i % len(_run_bob_r)][0] - (2 if i % 2 else 0),
+                    _run_bob_r[i % len(_run_bob_r)][1] - (1 if i % 2 else 0),
+                )
+                for i in range(len(rsr_f))
             )
             self._frame_offsets['run_shoot_left'] = tuple(
-                _run_bob_l[i % len(_run_bob_l)] for i in range(len(rsl_f))
+                (
+                    _run_bob_l[i % len(_run_bob_l)][0] + (2 if i % 2 else 0),
+                    _run_bob_l[i % len(_run_bob_l)][1] - (1 if i % 2 else 0),
+                )
+                for i in range(len(rsl_f))
             )
-            self._frame_offsets['shoot_right'] = ((0, 0), (-3, 0))
-            self._frame_offsets['shoot_left']  = ((0, 0), (3, 0))
+            # Stationary fire gets a stronger arcade-style kick.
+            self._frame_offsets['shoot_right'] = ((0, 0), (-5, -1))
+            self._frame_offsets['shoot_left']  = ((0, 0), (5, -1))
         elif lsheet is not None and rsheet is not None:
             # New sheets: 5/8/8/6/8/8/7 frame counts
             self._frame_offsets: Dict[str, Tuple[Tuple[int, int], ...]] = {
@@ -5224,6 +5234,41 @@ def main() -> None:
             _rim_img = _player_outline_cache[_rim_key]
             screen.blit(_rim_img, _rim_img.get_rect(center=_draw_rect.center))
             screen.blit(_draw_img, _draw_rect)
+
+            # Hood / mask eye glow — subtle at rest, brighter while firing.
+            # This is an overlay only; it never alters sprite art or hitboxes.
+            _eye_phase = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.010)
+            _eye_alpha = 80 + int(70 * _eye_phase)
+            if 'shoot' in _pose_state:
+                _eye_alpha = min(255, _eye_alpha + 65)
+            if trauma_mode:
+                _eye_alpha = min(255, _eye_alpha + 35)
+
+            _face_right = player_animator._last_facing >= 0
+            _eye_x = _draw_rect.centerx + (7 if _face_right else -7)
+            _eye_y = _draw_rect.top + int(_draw_rect.height * 0.23)
+
+            _eye_glow = pygame.Surface((26, 14), pygame.SRCALPHA)
+            pygame.draw.ellipse(
+                _eye_glow,
+                (255, 70, 10, max(35, _eye_alpha // 3)),
+                (2, 3, 22, 8),
+            )
+            pygame.draw.ellipse(
+                _eye_glow,
+                (255, 120, 25, _eye_alpha),
+                (6, 5, 14, 4),
+            )
+            pygame.draw.ellipse(
+                _eye_glow,
+                (255, 225, 150, min(255, _eye_alpha + 35)),
+                (10, 6, 6, 2),
+            )
+            screen.blit(
+                _eye_glow,
+                (_eye_x - 13, _eye_y - 7),
+                special_flags=pygame.BLEND_RGBA_ADD,
+            )
 
             if ancestral_protection_charges > 0:
                 # Sacred-tech guard: dual rings + rotating arc nodes instead of
