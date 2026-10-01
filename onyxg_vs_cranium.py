@@ -2776,6 +2776,7 @@ def main() -> None:
     _wave_cache  = {'val': -1, 'surf': None}
     _perks_cache  = {'val': '', 'surf': None}
     _scale_cache  = {'key': None, 'surf': None}   # sprite transform.scale cache
+    _player_outline_cache = {}                    # pose/size -> cyan silhouette rim
     _streak_cache = {'key': None, 'surf': None}   # streak message text cache
     _combo_cache  = {'val': None, 'surf': None}    # combo counter text cache
     _block_pct_cache  = {'val': None, 'col': None, 'surf': None}
@@ -4132,17 +4133,30 @@ def main() -> None:
                 sprite_rect.center = (round(player_position.x), round(player_position.y))
                 sprite_rect.clamp_ip(screen_bounds)
                 player_position.update(sprite_rect.center)
-                # Keep the existing trail, but tie it to actual velocity.
-                if player_velocity.length_squared() > 0.55:
-                    for _ in range(2):
+                # Player art pass: velocity-driven exhaust trail.
+                # Boosted movement gets a denser, brighter streak without changing physics.
+                _player_speed_now = player_velocity.length()
+                if _player_speed_now > 0.55:
+                    _boosting_visual = (
+                        movement_boost > 0.20
+                        or sativa_active
+                        or _player_speed_now > base_speed + 0.35
+                    )
+                    _trail_count = 4 if _boosting_visual else 2
+                    _trail_cols = (
+                        [(0, 255, 180), (70, 255, 220), (180, 255, 240)]
+                        if sativa_active else
+                        [(0, 170, 255), (40, 220, 255), (150, 245, 255)]
+                    )
+                    for _ in range(_trail_count):
                         particles.append(Particle(
-                            x=float(sprite_rect.centerx + random.randint(-6, 6)),
-                            y=float(sprite_rect.bottom - 4),
-                            vx=random.uniform(-0.4, 0.4) - player_velocity.x * 0.05,
-                            vy=random.uniform(1.5, 3.5) - player_velocity.y * 0.05,
-                            life=random.randint(8, 18),
-                            max=18,
-                            color=random.choice([(0,150,255),(50,200,255),(100,230,255)]),
+                            x=float(sprite_rect.centerx + random.randint(-8, 8)),
+                            y=float(sprite_rect.bottom - random.randint(1, 5)),
+                            vx=random.uniform(-0.7, 0.7) - player_velocity.x * (0.14 if _boosting_visual else 0.07),
+                            vy=random.uniform(1.8, 4.6) - player_velocity.y * 0.07,
+                            life=random.randint(10, 22) if _boosting_visual else random.randint(7, 15),
+                            max=22 if _boosting_visual else 15,
+                            color=random.choice(_trail_cols),
                         ))
 
                 fire_timer = max(0, fire_timer - 1)
@@ -4158,18 +4172,21 @@ def main() -> None:
                         fireballs.append(pygame.Rect(sprite_rect.centerx + 8,  sprite_rect.top, 8, 16))
                     else:
                         fireballs.append(pygame.Rect(sprite_rect.centerx - 4, sprite_rect.top, 8, 16))
-                    # Muzzle flash — Contra-style spark burst at gun barrel
+                    # Player art pass: hotter, wider muzzle flash for better shot readability.
                     _mz_x = float(sprite_rect.centerx)
                     _mz_y = float(sprite_rect.top + 2)
-                    for _ in range(4):
+                    for _ in range(7):
                         particles.append({
-                            'x': _mz_x + random.uniform(-5, 5),
-                            'y': _mz_y,
-                            'vx': random.uniform(-2.0, 2.0),
-                            'vy': random.uniform(-4.5, -1.0),
-                            'life': random.randint(3, 5),
-                            'max': 5,
-                            'color': random.choice([(255, 255, 180), (255, 200, 50), (255, 130, 20)]),
+                            'x': _mz_x + random.uniform(-7, 7),
+                            'y': _mz_y + random.uniform(-2, 2),
+                            'vx': random.uniform(-2.8, 2.8),
+                            'vy': random.uniform(-5.5, -1.2),
+                            'life': random.randint(4, 7),
+                            'max': 7,
+                            'color': random.choice([
+                                (255, 255, 230), (255, 230, 100),
+                                (255, 175, 35), (80, 225, 255),
+                            ]),
                         })
                     fire_timer = perk_fire_cooldown
                     if shoot_sound:
@@ -4205,16 +4222,19 @@ def main() -> None:
                             {'x': cx, 'y': cy, 'vx': -_spds, 'vy': 0},
                             {'x': cx, 'y': cy, 'vx':  _spds, 'vy': 0},
                         ]
-                    # Muzzle flash — Contra-style spark burst (fires both directions)
-                    for _ in range(4):
+                    # Player art pass: side-fire flash reads clearly against busy backgrounds.
+                    for _ in range(7):
                         particles.append({
-                            'x': cx + random.uniform(-8, 8),
-                            'y': cy + random.uniform(-8, 8),
-                            'vx': random.choice([-1, 1]) * random.uniform(3.0, 6.0),
-                            'vy': random.uniform(-1.5, 1.5),
-                            'life': random.randint(3, 5),
-                            'max': 5,
-                            'color': random.choice([(255, 255, 180), (255, 200, 50), (255, 130, 20)]),
+                            'x': cx + random.uniform(-10, 10),
+                            'y': cy + random.uniform(-9, 9),
+                            'vx': random.choice([-1, 1]) * random.uniform(3.8, 7.0),
+                            'vy': random.uniform(-2.0, 2.0),
+                            'life': random.randint(4, 7),
+                            'max': 7,
+                            'color': random.choice([
+                                (255, 255, 230), (255, 230, 100),
+                                (255, 175, 35), (80, 225, 255),
+                            ]),
                         })
                     side_fire_timer = perk_fire_cooldown
                     if shoot_sound:
@@ -4908,7 +4928,11 @@ def main() -> None:
             _prev_pose_state = _pose_state
 
             # Invulnerability frames still prevent repeat damage, but never hide
-            # the player sprite. This keeps the character readable during combat.
+            # the player sprite. Player art pass adds a shadow + adaptive rim so
+            # Onyx G stays readable against every level background.
+            _draw_img = current_sprite_image
+            _draw_rect = current_sprite_image.get_rect(center=player_render_center)
+
             if beat_pulse > 0 or sativa_active:
                 _bp_t    = beat_pulse / BEAT_PULSE_FRAMES if beat_pulse > 0 else 1.0
                 _scale_m = 0.45 if sativa_active else 0.18
@@ -4920,9 +4944,10 @@ def main() -> None:
                 if _scale_cache['key'] != _bp_key:
                     _scale_cache['key']  = _bp_key
                     _scale_cache['surf'] = pygame.transform.scale(current_sprite_image, (_bp_w, _bp_h))
-                _bp_img  = _scale_cache['surf']
-                _bp_r    = _bp_img.get_rect(center=player_render_center)
-                # glow ring
+                _draw_img  = _scale_cache['surf']
+                _draw_rect = _draw_img.get_rect(center=player_render_center)
+
+                # Existing beat/hydration glow remains behind the upgraded rim.
                 _glow_m  = 1.4 if sativa_active else 0.6
                 _glow_r  = int(sprite_rect.width * _glow_m * max(_bp_t, 0.4 if sativa_active else 0))
                 if _glow_r > 2:
@@ -4932,16 +4957,61 @@ def main() -> None:
                     pygame.draw.circle(_sprite_glow_surf, (*_gcol, _glow_a),
                                        (120, 120), _glow_r)
                     screen.blit(_sprite_glow_surf,
-                                (_bp_r.centerx - 120, _bp_r.centery - 120))
-                screen.blit(_bp_img, _bp_r)
-            else:
-                _player_render_rect = current_sprite_image.get_rect(center=player_render_center)
-                screen.blit(current_sprite_image, _player_render_rect)
+                                (_draw_rect.centerx - 120, _draw_rect.centery - 120))
 
-            if ancestral_protection_charges > 0 and iframe_timer % 6 < 3:
-                _aura_rad = sprite_rect.width // 2 + 8 + (2 if not PHOTOSENSITIVE_SAFE_MODE else 0)
-                _aura_col = (140, 255, 210) if PHOTOSENSITIVE_SAFE_MODE else (190, 255, 230)
+            # Soft contact shadow anchors the sprite to the ground/scene.
+            _shadow_w = max(28, int(sprite_rect.width * 0.90))
+            _shadow_h = max(8, int(sprite_rect.height * 0.16))
+            _shadow_rect = pygame.Rect(
+                sprite_rect.centerx - _shadow_w // 2,
+                sprite_rect.bottom - _shadow_h // 2,
+                _shadow_w,
+                _shadow_h,
+            )
+            _shadow_surf = pygame.Surface((_shadow_w, _shadow_h), pygame.SRCALPHA)
+            pygame.draw.ellipse(_shadow_surf, (0, 0, 0, 105), _shadow_surf.get_rect())
+            screen.blit(_shadow_surf, _shadow_rect)
+
+            # Cached silhouette rim: cyan normally, mint while hydrated,
+            # gold on beat, red on hit. Slight overscale creates the border.
+            if hit_flash_timer > 0:
+                _rim_col = (255, 95, 80, 155)
+            elif sativa_active:
+                _rim_col = (70, 255, 190, 135)
+            elif beat_pulse > 0:
+                _rim_col = (255, 215, 70, 125)
+            else:
+                _rim_col = (55, 205, 255, 100)
+            _rim_key = (current_pose_key, _draw_img.get_size(), _rim_col)
+            if _rim_key not in _player_outline_cache:
+                _rim_mask = pygame.mask.from_surface(_draw_img)
+                _rim_src = _rim_mask.to_surface(
+                    setcolor=_rim_col,
+                    unsetcolor=(0, 0, 0, 0),
+                ).convert_alpha()
+                _rw = _draw_img.get_width() + 8
+                _rh = _draw_img.get_height() + 8
+                _player_outline_cache[_rim_key] = pygame.transform.smoothscale(
+                    _rim_src, (_rw, _rh))
+                if len(_player_outline_cache) > 48:
+                    _player_outline_cache.clear()
+            _rim_img = _player_outline_cache[_rim_key]
+            screen.blit(_rim_img, _rim_img.get_rect(center=_draw_rect.center))
+            screen.blit(_draw_img, _draw_rect)
+
+            if ancestral_protection_charges > 0:
+                # Sacred-tech guard: dual rings + rotating arc nodes instead of
+                # the old plain circle. The effect is readable without hiding Onyx G.
+                _aura_rad = sprite_rect.width // 2 + 12
+                _aura_col = (150, 255, 220) if PHOTOSENSITIVE_SAFE_MODE else (190, 255, 235)
                 pygame.draw.circle(screen, _aura_col, sprite_rect.center, _aura_rad, 2)
+                pygame.draw.circle(screen, (80, 210, 190), sprite_rect.center, max(8, _aura_rad - 6), 1)
+                _guard_phase = (frame_count * 0.035) % math.tau
+                for _gi in range(3):
+                    _ga = _guard_phase + _gi * (math.tau / 3.0)
+                    _gx = int(sprite_rect.centerx + math.cos(_ga) * _aura_rad)
+                    _gy = int(sprite_rect.centery + math.sin(_ga) * _aura_rad)
+                    pygame.draw.circle(screen, _aura_col, (_gx, _gy), 3)
 
             # Fireball color shifts with shot tier
             if sativa_active:
