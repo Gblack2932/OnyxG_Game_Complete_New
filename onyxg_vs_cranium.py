@@ -553,9 +553,20 @@ class PlayerSpriteAnimator:
 
                 for _f in _frames:
                     _g = _f.copy()
-                    _alpha = pygame.surfarray.pixels_alpha(_g)
-                    _alpha[_alpha > 0] = 255
-                    del _alpha
+                    _w, _h = _g.get_size()
+
+                    # Force every visible sprite pixel fully opaque without NumPy.
+                    # Transparent background pixels stay transparent.
+                    _g.lock()
+                    try:
+                        for _py in range(_h):
+                            for _px in range(_w):
+                                _r, _gr, _b, _a = _g.get_at((_px, _py))
+                                if _a > 0:
+                                    _g.set_at((_px, _py), (_r, _gr, _b, 255))
+                    finally:
+                        _g.unlock()
+
                     _fixed.append(_g)
 
                 return tuple(_fixed)
