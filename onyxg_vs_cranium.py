@@ -930,8 +930,13 @@ class PlayerSpriteAnimator:
         frames = self._frames[state]
         if len(frames) == 1:
             frame_index = 0
+        elif state in ('run_right', 'run_left'):
+            # Use real elapsed time for the leg cycle. This guarantees the
+            # stride advances while moving even if the global frame counter
+            # stalls, skips, or is reused elsewhere.
+            frame_index = (pygame.time.get_ticks() // 105) % len(frames)
         elif state in ('run_shoot_right', 'run_shoot_left'):
-            frame_index = (frame_count // self._RUN_SHOOT_CYCLE_FRAMES) % len(frames)
+            frame_index = (pygame.time.get_ticks() // 95) % len(frames)
         elif state in ('fly_shoot_right', 'fly_shoot_left',
                         'fly_up_shoot_right', 'fly_up_shoot_left',
                         'fly_dn_shoot_right', 'fly_dn_shoot_left'):
