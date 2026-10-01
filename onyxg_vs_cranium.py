@@ -967,6 +967,7 @@ class PlayerSpriteAnimator:
             is_upward_shooting: bool,
             is_side_shooting: bool,
             side_shot_direction: int,
+            is_horizontal_moving: bool,
             is_hit: bool,
             frame_count: int,
     ) -> Tuple[pygame.Surface, str, Tuple[int, int]]:
@@ -990,7 +991,10 @@ class PlayerSpriteAnimator:
                 else:
                     state = f'fly_shoot_{direction}'
             else:
-                if abs(velocity.x) > 0.45:
+                # Use actual horizontal movement intent, not momentum threshold.
+                # This prevents the stationary firing pose from sliding across
+                # the screen during acceleration/deceleration.
+                if is_horizontal_moving:
                     state = f'run_shoot_{direction}'
                 else:
                     state = f'shoot_{direction}'
@@ -5111,6 +5115,7 @@ def main() -> None:
                 shoot_pose_timer > 0,
                 side_shoot_pose_timer > 0,
                 side_shot_direction,
+                abs(move_input.x) > 0.05,
                 hit_flash_timer > 0,
                 frame_count,
             )
