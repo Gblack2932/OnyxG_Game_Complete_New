@@ -525,6 +525,7 @@ class PlayerSpriteAnimator:
         lsheet: Optional[pygame.Surface] = None,
         rsheet: Optional[pygame.Surface] = None,
         gritty_sheet: Optional[pygame.Surface] = None,
+        movement_sheet: Optional[pygame.Surface] = None,
     ) -> None:
         """Bake every animation frame once at startup."""
 
@@ -575,29 +576,77 @@ class PlayerSpriteAnimator:
 
                 return tuple(_fixed)
 
-            # Top row: 2 idle frames + 5 run frames.
+            def _cm(rects, tgt=GRITTY_STAND):
+                """Movement-only sheet cropper; same opacity cleanup as gritty art."""
+                if movement_sheet is None:
+                    return ()
+                _frames = _cut_sheet_frames(movement_sheet, rects, tgt)
+                _fixed = []
+                for _f in _frames:
+                    _g = _f.copy()
+                    _w, _h = _g.get_size()
+                    _g.lock()
+                    try:
+                        for _py in range(_h):
+                            for _px in range(_w):
+                                _r, _gr, _b, _a = _g.get_at((_px, _py))
+                                if _a > 0:
+                                    _g.set_at((_px, _py), (_r, _gr, _b, 255))
+                    finally:
+                        _g.unlock()
+                    _fixed.append(_g)
+                return tuple(_fixed)
+
+            # Idle stays on the original gritty sheet.
             idle_f = _cg([
                 (18, 36, 122, 172),
                 (145, 36, 125, 172),
             ])
-            # Four strongest stride silhouettes. The middle generated frame is
-            # intentionally skipped because it reads too similarly at game scale.
-            rr_f = _cg([
-                (300, 38, 168, 172),
-                (472, 36, 162, 172),
-                (770, 38, 172, 172),
-                (934, 40, 174, 172),
-            ])
-            rl_f = tuple(pygame.transform.flip(f, True, False) for f in rr_f)
 
-            # Run + shoot right (4 frames), mirrored for left.
-            rsr_f = _cg([
-                (414, 516, 176, 170),
-                (570, 518, 226, 168),
-                (754, 518, 176, 168),
-                (906, 516, 210, 170),
-            ])
-            rsl_f = tuple(pygame.transform.flip(f, True, False) for f in rsr_f)
+            if movement_sheet is not None:
+                # Dedicated movement supplement — four clearly separated leg poses.
+                # Source sheet is 1086x1448. These cells exclude the section labels.
+                rr_f = _cm([
+                    (237, 40, 103, 165),
+                    (340, 40, 132, 165),
+                    (472, 40,  87, 165),
+                    (559, 40, 108, 165),
+                ])
+                rl_f = _cm([
+                    (682, 40,  91, 165),
+                    (773, 40, 102, 165),
+                    (875, 40, 109, 165),
+                    (984, 40,  85, 165),
+                ])
+
+                rsr_f = _cm([
+                    ( 19, 495, 116, 150),
+                    (135, 495, 105, 150),
+                    (240, 495, 160, 150),
+                    (400, 495, 147, 150),
+                ])
+                rsl_f = _cm([
+                    (556, 495, 146, 150),
+                    (702, 495, 115, 150),
+                    (817, 495, 113, 150),
+                    (930, 495, 146, 150),
+                ])
+            else:
+                # Safe fallback to the original gritty sheet.
+                rr_f = _cg([
+                    (300, 38, 168, 172),
+                    (472, 36, 162, 172),
+                    (770, 38, 172, 172),
+                    (934, 40, 174, 172),
+                ])
+                rl_f = tuple(pygame.transform.flip(f, True, False) for f in rr_f)
+                rsr_f = _cg([
+                    (414, 516, 176, 170),
+                    (570, 518, 226, 168),
+                    (754, 518, 176, 168),
+                    (906, 516, 210, 170),
+                ])
+                rsl_f = tuple(pygame.transform.flip(f, True, False) for f in rsr_f)
 
             # Upward shooting (2 frames), mirrored for left.
             shu_f = _cg([
@@ -2609,18 +2658,26 @@ def main() -> None:
     _lsheet_path = find_file(dir_map, "LeftAnimatons.png")
     _rsheet_path = find_file(dir_map, "RightAnimations.png")
     _gritty_sheet_path = find_file(dir_map, "OnyxG_Gritty_Sprite_Sheet.png")
+    _movement_sheet_path = find_file(dir_map, "OnyxG_Movement_Sprite_Sheet.png")
     _lsheet = pygame.image.load(_lsheet_path).convert_alpha() if _lsheet_path else None
     _rsheet = pygame.image.load(_rsheet_path).convert_alpha() if _rsheet_path else None
     _gritty_sheet = (
         pygame.image.load(_gritty_sheet_path).convert_alpha()
         if _gritty_sheet_path else None
     )
+    _movement_sheet = (
+        pygame.image.load(_movement_sheet_path).convert_alpha()
+        if _movement_sheet_path else None
+    )
     if _gritty_sheet is not None:
         print("🎭 Gritty Onyx G sprite sheet loaded.")
+    if _movement_sheet is not None:
+        print("🏃 Onyx G movement sprite sheet loaded.")
     player_animator = PlayerSpriteAnimator(
         sprite_idle_image, sprite_shoot_image,
         sheet=_anim_sheet, lsheet=_lsheet, rsheet=_rsheet,
         gritty_sheet=_gritty_sheet,
+        movement_sheet=_movement_sheet,
     )
     # Keep this name for existing rect init and fallback paths.
     sprite_image       = sprite_idle_image
