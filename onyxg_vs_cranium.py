@@ -524,6 +524,7 @@ class PlayerSpriteAnimator:
         sheet: Optional[pygame.Surface] = None,
         lsheet: Optional[pygame.Surface] = None,
         rsheet: Optional[pygame.Surface] = None,
+        gritty_sheet: Optional[pygame.Surface] = None,
     ) -> None:
         """Bake every animation frame once at startup."""
 
@@ -542,7 +543,78 @@ class PlayerSpriteAnimator:
         STAND = cfg.PLAYER_SIZE                                      # (80, 160)
         FLY = (int(cfg.PLAYER_SIZE[0] * 2.0), int(cfg.PLAYER_SIZE[1] * 0.65))
 
-        if lsheet is not None and rsheet is not None:
+        if gritty_sheet is not None:
+            # ── GRITTY ONYX G SHEET ─────────────────────────────────────────
+            # Primary art source. Left-facing poses are mirrored from the
+            # right-facing frames so one production sheet covers both directions.
+            def _cg(rects, tgt=STAND):
+                return _cut_sheet_frames(gritty_sheet, rects, tgt)
+
+            # Top row: 2 idle frames + 5 run frames.
+            idle_f = _cg([
+                (18, 36, 122, 172),
+                (145, 36, 125, 172),
+            ])
+            rr_f = _cg([
+                (300, 38, 168, 172),
+                (472, 36, 162, 172),
+                (628, 38, 158, 172),
+                (770, 38, 172, 172),
+                (934, 40, 174, 172),
+            ])
+            rl_f = tuple(pygame.transform.flip(f, True, False) for f in rr_f)
+
+            # Run + shoot right (4 frames), mirrored for left.
+            rsr_f = _cg([
+                (414, 516, 176, 170),
+                (570, 518, 226, 168),
+                (754, 518, 176, 168),
+                (906, 516, 210, 170),
+            ])
+            rsl_f = tuple(pygame.transform.flip(f, True, False) for f in rsr_f)
+
+            # Upward shooting (2 frames), mirrored for left.
+            shu_f = _cg([
+                (360, 245, 150, 230),
+                (495, 245, 165, 230),
+            ])
+            shu_l_f = tuple(pygame.transform.flip(f, True, False) for f in shu_f)
+
+            # Jetpack hover art for vertical movement.
+            fr_f = _cg([
+                (12, 896, 142, 190),
+                (150, 898, 140, 190),
+                (294, 892, 140, 190),
+            ], FLY)
+            fl_f = tuple(pygame.transform.flip(f, True, False) for f in fr_f)
+
+            # Jetpack shoot-right sequence, mirrored for left.
+            fsr_f = _cg([
+                (10, 1134, 176, 205),
+                (154, 1134, 226, 205),
+                (342, 1134, 224, 205),
+                (530, 1134, 224, 205),
+            ], FLY)
+            fsl_f = tuple(pygame.transform.flip(f, True, False) for f in fsr_f)
+
+            # Jetpack upward-shoot sequence.
+            fsu_r_f = _cg([
+                (758, 1124, 160, 266),
+                (922, 1124, 190, 266),
+            ], FLY)
+            fsu_l_f = tuple(pygame.transform.flip(f, True, False) for f in fsu_r_f)
+
+            # Low/braced pose makes a clean hit reaction without changing hitbox.
+            hit_f = _cg([
+                (24, 720, 166, 145),
+            ])
+
+            _fup_r = fsr_f
+            _fup_l = fsl_f
+            _fdn_r = fsr_f
+            _fdn_l = fsl_f
+
+        elif lsheet is not None and rsheet is not None:
             # ── NEW SHEETS: LeftAnimatons.png + RightAnimations.png ──────────
             # Both sheets share identical row y-ranges (9 rows, transparent bg).
             # L = left-facing, R = right-facing.  All frames scaled to STAND.
@@ -714,7 +786,25 @@ class PlayerSpriteAnimator:
         }
 
         # Per-frame visual-only (x, y) offsets — hitbox is never affected.
-        if lsheet is not None and rsheet is not None:
+        if gritty_sheet is not None:
+            self._frame_offsets = {
+                key: tuple((0, 0) for _ in frames)
+                for key, frames in self._frames.items()
+            }
+            # Tiny animation-only grounding tweaks.
+            self._frame_offsets['run_right'] = tuple(
+                ((1, 2) if i % 2 == 0 else (0, -1)) for i in range(len(rr_f))
+            )
+            self._frame_offsets['run_left'] = tuple(
+                ((-1, 2) if i % 2 == 0 else (0, -1)) for i in range(len(rl_f))
+            )
+            self._frame_offsets['run_shoot_right'] = tuple(
+                ((1, 1) if i % 2 == 0 else (0, -1)) for i in range(len(rsr_f))
+            )
+            self._frame_offsets['run_shoot_left'] = tuple(
+                ((-1, 1) if i % 2 == 0 else (0, -1)) for i in range(len(rsl_f))
+            )
+        elif lsheet is not None and rsheet is not None:
             # New sheets: 5/8/8/6/8/8/7 frame counts
             self._frame_offsets: Dict[str, Tuple[Tuple[int, int], ...]] = {
                 'idle':               ((0,0),(0,0),(0,0),(0,0),(0,0)),
@@ -2481,11 +2571,19 @@ def main() -> None:
     _anim_sheet = pygame.image.load(_anim_sheet_path).convert_alpha() if _anim_sheet_path else None
     _lsheet_path = find_file(dir_map, "LeftAnimatons.png")
     _rsheet_path = find_file(dir_map, "RightAnimations.png")
+    _gritty_sheet_path = find_file(dir_map, "OnyxG_Gritty_Sprite_Sheet.png")
     _lsheet = pygame.image.load(_lsheet_path).convert_alpha() if _lsheet_path else None
     _rsheet = pygame.image.load(_rsheet_path).convert_alpha() if _rsheet_path else None
+    _gritty_sheet = (
+        pygame.image.load(_gritty_sheet_path).convert_alpha()
+        if _gritty_sheet_path else None
+    )
+    if _gritty_sheet is not None:
+        print("🎭 Gritty Onyx G sprite sheet loaded.")
     player_animator = PlayerSpriteAnimator(
         sprite_idle_image, sprite_shoot_image,
         sheet=_anim_sheet, lsheet=_lsheet, rsheet=_rsheet,
+        gritty_sheet=_gritty_sheet,
     )
     # Keep this name for existing rect init and fallback paths.
     sprite_image       = sprite_idle_image
