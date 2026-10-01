@@ -4984,6 +4984,10 @@ def main() -> None:
                 _rim_col = (55, 205, 255, 100)
             _rim_key = (current_pose_key, _draw_img.get_size(), _rim_col)
             if _rim_key not in _player_outline_cache:
+                # Clear BEFORE inserting so the current rim can never be deleted
+                # and immediately looked up again.
+                if len(_player_outline_cache) >= 48:
+                    _player_outline_cache.clear()
                 _rim_mask = pygame.mask.from_surface(_draw_img)
                 _rim_src = _rim_mask.to_surface(
                     setcolor=_rim_col,
@@ -4993,8 +4997,6 @@ def main() -> None:
                 _rh = _draw_img.get_height() + 8
                 _player_outline_cache[_rim_key] = pygame.transform.smoothscale(
                     _rim_src, (_rw, _rh))
-                if len(_player_outline_cache) > 48:
-                    _player_outline_cache.clear()
             _rim_img = _player_outline_cache[_rim_key]
             screen.blit(_rim_img, _rim_img.get_rect(center=_draw_rect.center))
             screen.blit(_draw_img, _draw_rect)
