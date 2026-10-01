@@ -548,7 +548,17 @@ class PlayerSpriteAnimator:
             # Primary art source. Left-facing poses are mirrored from the
             # right-facing frames so one production sheet covers both directions.
             def _cg(rects, tgt=STAND):
-                return _cut_sheet_frames(gritty_sheet, rects, tgt)
+                _frames = _cut_sheet_frames(gritty_sheet, rects, tgt)
+                _fixed = []
+
+                for _f in _frames:
+                    _g = _f.copy()
+                    _alpha = pygame.surfarray.pixels_alpha(_g)
+                    _alpha[_alpha > 0] = 255
+                    del _alpha
+                    _fixed.append(_g)
+
+                return tuple(_fixed)
 
             # Top row: 2 idle frames + 5 run frames.
             idle_f = _cg([
