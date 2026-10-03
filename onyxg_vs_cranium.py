@@ -2741,11 +2741,38 @@ def main() -> None:
     pygame.init()
     # ── Xbox / gamepad controller support ─────────────────────────────────────
     pygame.joystick.init()
-    _joy = None   # connected Joystick object, or None if no controller
-    if pygame.joystick.get_count() > 0:
-        _joy = pygame.joystick.Joystick(0)
-        _joy.init()
-        print(f"🎮 Controller connected: {_joy.get_name()}")
+    _joy = None   # active controller; switches to whichever device actually sends input
+    _joysticks = {}
+
+    def _refresh_joysticks():
+        nonlocal _joy
+        _joysticks.clear()
+        for _ji in range(pygame.joystick.get_count()):
+            try:
+                _js = pygame.joystick.Joystick(_ji)
+                _js.init()
+                _joysticks[_js.get_instance_id()] = _js
+                print(
+                    f"🎮 Controller {_ji}: {_js.get_name()} "
+                    f"(instance={_js.get_instance_id()}, axes={_js.get_numaxes()}, "
+                    f"buttons={_js.get_numbuttons()}, hats={_js.get_numhats()})"
+                )
+            except pygame.error:
+                pass
+        if _joy is None and _joysticks:
+            _joy = next(iter(_joysticks.values()))
+
+    def _activate_joy_from_event(event):
+        nonlocal _joy
+        _iid = getattr(event, 'instance_id', None)
+        if _iid is None:
+            _iid = getattr(event, 'joy', None)
+        _candidate = _joysticks.get(_iid)
+        if _candidate is not None and _candidate is not _joy:
+            _joy = _candidate
+            print(f"🎮 Active controller switched to: {_joy.get_name()} (instance={_iid})")
+
+    _refresh_joysticks()
     impact_channel   = pygame.mixer.Channel(0)  # ch 0: enemy/player hits — never dropped
     burst_channel    = pygame.mixer.Channel(1)  # ch 1: signal burst punch
     run_channel      = pygame.mixer.Channel(2)  # ch 2: run footsteps (looping)
@@ -4186,14 +4213,26 @@ def main() -> None:
                 if event.type == pygame.QUIT:
                     pygame.quit()
                     sys.exit()
-                # ── Controller hot-plug ────────────────────────────────────
-                if event.type == pygame.JOYDEVICEADDED and _joy is None:
-                    _joy = pygame.joystick.Joystick(event.device_index)
-                    _joy.init()
-                    print(f"🎮 Controller connected: {_joy.get_name()}")
+                # ── Controller hot-plug / active-device selection ───────────
+                if event.type == pygame.JOYDEVICEADDED:
+                    _refresh_joysticks()
                 elif event.type == pygame.JOYDEVICEREMOVED:
-                    _joy = None
+                    _removed = getattr(event, 'instance_id', None)
+                    if _removed in _joysticks:
+                        _joysticks.pop(_removed, None)
+                    if _joy is not None and getattr(_joy, 'get_instance_id', lambda: None)() == _removed:
+                        _joy = None
+                    _refresh_joysticks()
                     print("🎮 Controller disconnected.")
+                elif event.type in (
+                    pygame.JOYAXISMOTION,
+                    pygame.JOYBUTTONDOWN,
+                    pygame.JOYBUTTONUP,
+                    pygame.JOYHATMOTION,
+                ):
+                    # macOS may expose one Xbox pad as multiple logical devices.
+                    # Whichever device actually sends input becomes the active pad.
+                    _activate_joy_from_event(event)
                 # ── Continue screen ────────────────────────────────────────
                 _do_continue = (
                     event.type == pygame.KEYDOWN
