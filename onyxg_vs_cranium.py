@@ -1332,6 +1332,23 @@ def _tutorial_screen(screen: pygame.Surface, clock: pygame.time.Clock,
                     page_idx = min(len(pages) - 1, page_idx + 1)
                 elif event.key in (pygame.K_LEFT, pygame.K_a):
                     page_idx = max(0, page_idx - 1)
+            if event.type == pygame.JOYHATMOTION:
+                if event.value[0] > 0:
+                    page_idx = min(len(pages) - 1, page_idx + 1)
+                elif event.value[0] < 0:
+                    page_idx = max(0, page_idx - 1)
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button == 0:  # Xbox A = next / close
+                    if len(pages) > 1 and page_idx < len(pages) - 1:
+                        page_idx += 1
+                    else:
+                        return
+                elif event.button == 1:  # Xbox B = back/close
+                    return
+                elif event.button == 13:
+                    page_idx = max(0, page_idx - 1)
+                elif event.button == 14:
+                    page_idx = min(len(pages) - 1, page_idx + 1)
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if len(pages) > 1 and page_idx < len(pages) - 1:
                     page_idx += 1
@@ -1485,6 +1502,7 @@ def _start_menu(screen, clock, menu_img, menu_music_file=None,
     font_soon = _get_arcade_font(20)
     font_btn  = _get_arcade_font(16)
     soon_timer = 0
+    selected = 0
     highlight  = pygame.Surface((btn_w, btn_h), pygame.SRCALPHA)
     highlight.fill((255, 255, 255, 55))
 
@@ -1492,12 +1510,13 @@ def _start_menu(screen, clock, menu_img, menu_music_file=None,
         screen.blit(menu_img, (0, 0))
         mx, my = pygame.mouse.get_pos()
 
-        for (rect, _), (label, _) in zip(rects, buttons):
-            pygame.draw.rect(screen, (15, 10, 35), rect, border_radius=6)
-            pygame.draw.rect(screen, (100, 60, 180), rect, 2, border_radius=6)
-            if rect.collidepoint(mx, my):
+        for i, ((rect, _), (label, _)) in enumerate(zip(rects, buttons)):
+            _active = (i == selected) or rect.collidepoint(mx, my)
+            pygame.draw.rect(screen, (26, 18, 52) if _active else (15, 10, 35), rect, border_radius=6)
+            pygame.draw.rect(screen, (145, 100, 220) if _active else (100, 60, 180), rect, 2, border_radius=6)
+            if _active:
                 screen.blit(highlight, rect.topleft)
-            _lbl = font_btn.render(label, True, (220, 200, 255))
+            _lbl = font_btn.render(label, True, (235, 220, 255) if _active else (220, 200, 255))
             screen.blit(_lbl, _lbl.get_rect(center=rect.center))
 
         if soon_timer > 0:
@@ -1510,41 +1529,65 @@ def _start_menu(screen, clock, menu_img, menu_music_file=None,
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
+            _activate_action = None
             if event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    return
-                if event.key == pygame.K_ESCAPE:
+                if event.key in (pygame.K_UP, pygame.K_w):
+                    selected = (selected - 1) % len(buttons)
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    selected = (selected + 1) % len(buttons)
+                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    _activate_action = buttons[selected][1]
+                elif event.key == pygame.K_ESCAPE:
                     pygame.quit()
                     sys.exit()
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                for rect, action in rects:
+
+            elif event.type == pygame.JOYHATMOTION:
+                if event.value[1] > 0:
+                    selected = (selected - 1) % len(buttons)
+                elif event.value[1] < 0:
+                    selected = (selected + 1) % len(buttons)
+
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button == 0:  # Xbox A
+                    _activate_action = buttons[selected][1]
+                elif event.button == 11:
+                    selected = (selected - 1) % len(buttons)
+                elif event.button == 12:
+                    selected = (selected + 1) % len(buttons)
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for i, (rect, action) in enumerate(rects):
                     if rect.collidepoint(event.pos):
-                        if action == "start":
-                            return
-                        elif action == "exit":
-                            pygame.quit()
-                            sys.exit()
-                        elif action == "tutorial" and tutorial_img is not None:
-                            _tutorial_screen(screen, clock, tutorial_img, tutorial_music_file)
-                            # Restore menu music after tutorial
-                            if menu_music_file:
-                                try:
-                                    pygame.mixer.music.load(menu_music_file)
-                                    pygame.mixer.music.set_volume(0.7)
-                                    pygame.mixer.music.play(-1)
-                                except pygame.error:
-                                    pass
-                        elif action == "credits":
-                            _credits_screen(screen, clock)
-                            if menu_music_file:
-                                try:
-                                    pygame.mixer.music.load(menu_music_file)
-                                    pygame.mixer.music.set_volume(0.7)
-                                    pygame.mixer.music.play(-1)
-                                except pygame.error:
-                                    pass
-                        else:
-                            soon_timer = 120
+                        selected = i
+                        _activate_action = action
+                        break
+
+            if _activate_action is not None:
+                if _activate_action == "start":
+                    return
+                elif _activate_action == "exit":
+                    pygame.quit()
+                    sys.exit()
+                elif _activate_action == "tutorial" and tutorial_img is not None:
+                    _tutorial_screen(screen, clock, tutorial_img, tutorial_music_file)
+                    if menu_music_file:
+                        try:
+                            pygame.mixer.music.load(menu_music_file)
+                            pygame.mixer.music.set_volume(0.7)
+                            pygame.mixer.music.play(-1)
+                        except pygame.error:
+                            pass
+                elif _activate_action == "credits":
+                    _credits_screen(screen, clock)
+                    if menu_music_file:
+                        try:
+                            pygame.mixer.music.load(menu_music_file)
+                            pygame.mixer.music.set_volume(0.7)
+                            pygame.mixer.music.play(-1)
+                        except pygame.error:
+                            pass
+                else:
+                    soon_timer = 120
 
         pygame.display.flip()
         clock.tick(60)
@@ -2199,6 +2242,7 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
     highlight.fill((255, 255, 255, 60))
 
     _top_score  = scores[0][0] if scores else 0
+    _result_selected = 0
     _RANK_COLS  = [( 57, 255,  20), (230, 230, 230), (180,  80, 255)]
     _RANK_LBLS  = ['1ST', '2ND', '3RD']
 
@@ -2368,8 +2412,12 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
                     )
                     screen.blit(_row_surf, _row_surf.get_rect(center=(monitor_safe.centerx, _ry)))
         mx, my = pygame.mouse.get_pos()
-        _hover_try = try_rect.collidepoint(mx, my)
-        _hover_menu = menu_rect.collidepoint(mx, my)
+        if try_rect.collidepoint(mx, my):
+            _result_selected = 0
+        elif menu_rect.collidepoint(mx, my):
+            _result_selected = 1
+        _hover_try = (_result_selected == 0)
+        _hover_menu = (_result_selected == 1)
         _draw_lose_button(try_rect, "TRY AGAIN" if is_lose else "PLAY AGAIN",
                           _hover_try, primary=False)
         _draw_lose_button(menu_rect, "MAIN MENU", _hover_menu, primary=False)
@@ -2380,14 +2428,41 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
                 sys.exit()
             if event.type == pygame.KEYDOWN:
                 if _displayed < score:
-                    _displayed = score   # skip roll-up
-                elif event.key in (pygame.K_RETURN, pygame.K_r):
+                    _displayed = score
+                elif event.key in (pygame.K_LEFT, pygame.K_UP, pygame.K_a, pygame.K_w):
+                    _result_selected = 0
+                elif event.key in (pygame.K_RIGHT, pygame.K_DOWN, pygame.K_d, pygame.K_s):
+                    _result_selected = 1
+                elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    return "restart" if _result_selected == 0 else "menu"
+                elif event.key == pygame.K_r:
                     return "restart"
                 elif event.key in (pygame.K_ESCAPE, pygame.K_m):
                     return "menu"
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+
+            elif event.type == pygame.JOYHATMOTION:
                 if _displayed < score:
-                    _displayed = score   # skip roll-up on click too
+                    _displayed = score
+                elif event.value[0] < 0 or event.value[1] > 0:
+                    _result_selected = 0
+                elif event.value[0] > 0 or event.value[1] < 0:
+                    _result_selected = 1
+
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if _displayed < score:
+                    _displayed = score
+                elif event.button == 0:  # Xbox A
+                    return "restart" if _result_selected == 0 else "menu"
+                elif event.button == 1:  # Xbox B
+                    return "menu"
+                elif event.button in (11, 13):
+                    _result_selected = 0
+                elif event.button in (12, 14):
+                    _result_selected = 1
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if _displayed < score:
+                    _displayed = score
                 elif try_rect.collidepoint(event.pos):
                     return "restart"
                 elif menu_rect.collidepoint(event.pos):
@@ -2531,6 +2606,31 @@ def _name_entry_screen(screen, clock, font_big, font_med, font,
                     cursor = max(0, cursor - 1)
                 elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     confirmed_name = ''.join(initials)
+            elif event.type == pygame.JOYHATMOTION:
+                if event.value[1] > 0:
+                    initials[cursor] = chr((ord(initials[cursor]) - ord('A') - 1) % 26 + ord('A'))
+                elif event.value[1] < 0:
+                    initials[cursor] = chr((ord(initials[cursor]) - ord('A') + 1) % 26 + ord('A'))
+                elif event.value[0] > 0:
+                    cursor = min(2, cursor + 1)
+                elif event.value[0] < 0:
+                    cursor = max(0, cursor - 1)
+            elif event.type == pygame.JOYBUTTONDOWN:
+                if event.button == 0:  # Xbox A = next / confirm
+                    if cursor < 2:
+                        cursor += 1
+                    else:
+                        confirmed_name = ''.join(initials)
+                elif event.button == 1:  # Xbox B = previous letter
+                    cursor = max(0, cursor - 1)
+                elif event.button == 11:
+                    initials[cursor] = chr((ord(initials[cursor]) - ord('A') - 1) % 26 + ord('A'))
+                elif event.button == 12:
+                    initials[cursor] = chr((ord(initials[cursor]) - ord('A') + 1) % 26 + ord('A'))
+                elif event.button == 13:
+                    cursor = max(0, cursor - 1)
+                elif event.button == 14:
+                    cursor = min(2, cursor + 1)
         pygame.display.flip()
         clock.tick(60)
 
