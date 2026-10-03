@@ -47,7 +47,7 @@ BUTTONS = [
     ("DPAD RIGHT", pygame.CONTROLLER_BUTTON_DPAD_RIGHT),
 ]
 
-print("Pygame:", pygame.version.ver, "SDL:", pygame.version.SDL())
+print("Pygame:", pygame.version.ver, "SDL:", pygame.get_sdl_version())
 print("SDL controller count:", gc.get_count())
 
 controller = None
