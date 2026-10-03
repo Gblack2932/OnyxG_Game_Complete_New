@@ -2245,32 +2245,17 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
         screen.blit(main, main.get_rect(center=center))
 
     def _draw_lose_button(rect, label, hovered, primary=True):
-        if primary:
-            top_col = (255, 165, 30) if hovered else (245, 128, 0)
-            bot_col = (195, 80, 0) if hovered else (145, 45, 0)
-            border_col = (255, 215, 70) if hovered else (255, 140, 30)
-            text_col = (255, 240, 205)
-            glow_col = (90, 35, 0)
-            inner_col = (30, 10, 0)
-        else:
-            top_col = (88, 88, 98) if hovered else (70, 70, 80)
-            bot_col = (42, 42, 50) if hovered else (28, 28, 35)
-            border_col = (168, 168, 188) if hovered else (120, 120, 138)
-            text_col = (230, 230, 238)
-            glow_col = (20, 20, 28)
-            inner_col = (14, 14, 20)
-        for i in range(rect.height):
-            t = i / max(1, rect.height - 1)
-            col = (
-                int(top_col[0] + (bot_col[0] - top_col[0]) * t),
-                int(top_col[1] + (bot_col[1] - top_col[1]) * t),
-                int(top_col[2] + (bot_col[2] - top_col[2]) * t),
-            )
-            pygame.draw.line(screen, col, (rect.left, rect.top + i), (rect.right - 1, rect.top + i))
-        pygame.draw.rect(screen, border_col, rect, 3, border_radius=10)
-        pygame.draw.rect(screen, inner_col, rect.inflate(-8, -8), 2, border_radius=8)
-        _label_font, _ = _fit_render(label, text_col, _btn_font_size, rect.width - 22, min_size=14)
-        _draw_arcade_text(label, _label_font, text_col, rect.center, glow_col)
+        # Match the clean start-menu buttons: dark violet panel, purple border,
+        # subtle hover lift, and one consistent text treatment.
+        fill_col = (26, 18, 52) if hovered else (15, 10, 35)
+        border_col = (145, 100, 220) if hovered else (100, 60, 180)
+        text_col = (235, 220, 255) if hovered else (220, 200, 255)
+        pygame.draw.rect(screen, fill_col, rect, border_radius=6)
+        pygame.draw.rect(screen, border_col, rect, 2, border_radius=6)
+        _label_font, _label_surf = _fit_render(
+            label, text_col, 16, rect.width - 20, min_size=12
+        )
+        screen.blit(_label_surf, _label_surf.get_rect(center=rect.center))
 
     # ── Score roll-up setup ──────────────────────────────────────────────
     _displayed  = 0
@@ -2291,6 +2276,14 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
 
     while True:
         screen.blit(img, (0, 0))
+
+        # Unified result panel — same restrained dark-violet language as the
+        # start menu, while preserving the win/lose background artwork.
+        _result_panel = pygame.Surface((monitor_safe.width, monitor_safe.height), pygame.SRCALPHA)
+        _result_panel.fill((8, 6, 20, 150))
+        screen.blit(_result_panel, monitor_safe.topleft)
+        pygame.draw.rect(screen, (100, 60, 180), monitor_safe, 1, border_radius=6)
+
         # Advance roll-up
         if _displayed < score:
             _displayed = min(score, _displayed + _step)
@@ -2300,7 +2293,7 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
         _show_new_best = False
         if score > 0:
             _sc_text = f"Score:  {_displayed:,}"
-            _, _sc = _fit_render(_sc_text, (57, 255, 20), _sf_size, monitor_safe.width - 12, min_size=16)
+            _, _sc = _fit_render(_sc_text, (235, 225, 255), _sf_size, monitor_safe.width - 12, min_size=16)
             if is_lose:
                 _sc_c = (monitor_safe.centerx, lose_score_y)
             else:
@@ -2316,7 +2309,7 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
             screen.blit(_rk, _rk.get_rect(center=_rk_c))
             if _displayed >= score and score >= _top_score:
                 _show_new_best = True
-                _, _nb = _fit_render("❖  NEW BEST  ❖", (180, 80, 255), _sf_size,
+                _, _nb = _fit_render("❖  NEW BEST  ❖", (255, 220, 90), _sf_size,
                                      monitor_safe.width - 10, min_size=16)
                 if is_lose:
                     _nb_c = (monitor_safe.centerx, lose_newbest_y)
@@ -2348,7 +2341,7 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
                 _win_first_offset = max(26, int(monitor_safe.height * 0.10))
                 _lby = win_board_header_y
                 _lbx = monitor_safe.centerx
-            _, _hdr = _fit_render(f'TOP SCORES ({leaderboard_label})', (180, 80, 255), _sf2_size,
+            _, _hdr = _fit_render(f'TOP SCORES ({leaderboard_label})', (220, 200, 255), _sf2_size,
                                   monitor_safe.width - 12, min_size=13)
             screen.blit(_hdr, _hdr.get_rect(center=(_lbx, _lby)))
             for _ri, _row in enumerate(scores):
@@ -2359,41 +2352,26 @@ def _result_screen(screen, clock, img, music_file, score=0, scores=None, is_lose
                 _hl  = (score > 0 and _ri == 0 and score >= _top_score)
                 _tc  = (255, 255, 255) if _hl else _col
                 if is_lose:
-                    _ry  = _lby + 22 + _ri * lose_row_gap
-                    _name_max = monitor_safe.width - 170
-                    pygame.draw.circle(screen, _col, (_lbx - 120, _ry), 10)
-                    pygame.draw.circle(screen, (0, 0, 0), (_lbx - 120, _ry), 6)
-                    _row_surf = _sf2.render(f"{_RANK_LBLS[_ri]}  {_rn}  {_rs:,}", True, _tc)
-                    screen.blit(_row_surf, _row_surf.get_rect(midleft=(_lbx - 102, _ry - 10)))
-                    if _rt:
-                        _t_small = _get_arcade_font(11).render(_rt, True, (160, 160, 160))
-                        screen.blit(_t_small, _t_small.get_rect(midleft=(_lbx + 8, _ry + 10)))
+                    _ry = _lby + 22 + _ri * lose_row_gap
+                    _row_col = (255, 255, 255) if _hl else (205, 195, 225)
+                    _row_text = f"{_RANK_LBLS[_ri]}   {_rn}   {_rs:,}"
+                    _, _row_surf = _fit_render(
+                        _row_text, _row_col, 15, monitor_safe.width - 24, min_size=11
+                    )
+                    screen.blit(_row_surf, _row_surf.get_rect(center=(_lbx, _ry)))
                 else:
-                    _ry  = win_board_top_y + _ri * _win_row_gap
-                    _row_left = monitor_safe.left + 14
-                    _row_right = monitor_safe.right - 14
-                    _badge_x = _row_left + 12
-                    _rank_cx = _row_left + 44
-                    _score_anchor = _row_right
-                    _name_left = _row_left + 76
-                    _name_right = _row_right - 88
-                    _name_max = max(40, _name_right - _name_left)
-                    pygame.draw.circle(screen, _col, (_badge_x, _ry), 9)
-                    pygame.draw.circle(screen, (0, 0, 0), (_badge_x, _ry), 5)
-                    _, _rank_surf = _fit_arcade_plain(_RANK_LBLS[_ri], 14, 42, _col, min_size=11)
-                    screen.blit(_rank_surf, _rank_surf.get_rect(center=(_rank_cx, _ry)))
-                    _, _name_surf = _fit_arcade_plain(_rn, 16, _name_max, _tc, min_size=12)
-                    _, _score_surf = _fit_arcade_plain(f"{_rs:,}", 16, 82, _col, min_size=11)
-                    screen.blit(_name_surf, _name_surf.get_rect(midleft=(_name_left, _ry)))
-                    screen.blit(_score_surf, _score_surf.get_rect(midright=(_score_anchor, _ry)))
-                    if _rt:
-                        _, _time_surf = _fit_arcade_plain(_rt, 11, 126, (150, 150, 150), min_size=9)
-                        screen.blit(_time_surf, _time_surf.get_rect(midright=(_score_anchor - 92, _ry + 12)))
+                    _ry = win_board_top_y + _ri * _win_row_gap
+                    _row_col = (255, 255, 255) if _hl else (205, 195, 225)
+                    _row_text = f"{_RANK_LBLS[_ri]}   {_rn}   {_rs:,}"
+                    _, _row_surf = _fit_render(
+                        _row_text, _row_col, 15, monitor_safe.width - 24, min_size=11
+                    )
+                    screen.blit(_row_surf, _row_surf.get_rect(center=(monitor_safe.centerx, _ry)))
         mx, my = pygame.mouse.get_pos()
         _hover_try = try_rect.collidepoint(mx, my)
         _hover_menu = menu_rect.collidepoint(mx, my)
         _draw_lose_button(try_rect, "TRY AGAIN" if is_lose else "PLAY AGAIN",
-                          _hover_try, primary=True)
+                          _hover_try, primary=False)
         _draw_lose_button(menu_rect, "MAIN MENU", _hover_menu, primary=False)
 
         for event in pygame.event.get():
