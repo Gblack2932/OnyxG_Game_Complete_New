@@ -1,4 +1,10 @@
+import os
 import sys
+
+# Same macOS Xbox workaround used by the game: force SDL away from the
+# HIDAPI path that can detect the pad but return only zero-valued input.
+os.environ.setdefault("SDL_JOYSTICK_HIDAPI", "0")
+
 import pygame
 
 try:
