@@ -5235,41 +5235,6 @@ def main() -> None:
             screen.blit(_rim_img, _rim_img.get_rect(center=_draw_rect.center))
             screen.blit(_draw_img, _draw_rect)
 
-            # Hood / mask eye glow — subtle at rest, brighter while firing.
-            # This is an overlay only; it never alters sprite art or hitboxes.
-            _eye_phase = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.010)
-            _eye_alpha = 80 + int(70 * _eye_phase)
-            if 'shoot' in _pose_state:
-                _eye_alpha = min(255, _eye_alpha + 65)
-            if trauma_mode:
-                _eye_alpha = min(255, _eye_alpha + 35)
-
-            _face_right = player_animator._last_facing >= 0
-            _eye_x = _draw_rect.centerx + (7 if _face_right else -7)
-            _eye_y = _draw_rect.top + int(_draw_rect.height * 0.23)
-
-            _eye_glow = pygame.Surface((26, 14), pygame.SRCALPHA)
-            pygame.draw.ellipse(
-                _eye_glow,
-                (255, 70, 10, max(35, _eye_alpha // 3)),
-                (2, 3, 22, 8),
-            )
-            pygame.draw.ellipse(
-                _eye_glow,
-                (255, 120, 25, _eye_alpha),
-                (6, 5, 14, 4),
-            )
-            pygame.draw.ellipse(
-                _eye_glow,
-                (255, 225, 150, min(255, _eye_alpha + 35)),
-                (10, 6, 6, 2),
-            )
-            screen.blit(
-                _eye_glow,
-                (_eye_x - 13, _eye_y - 7),
-                special_flags=pygame.BLEND_RGBA_ADD,
-            )
-
             if ancestral_protection_charges > 0:
                 # Sacred-tech guard: dual rings + rotating arc nodes instead of
                 # the old plain circle. The effect is readable without hiding Onyx G.
