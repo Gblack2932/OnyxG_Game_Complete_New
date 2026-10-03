@@ -2906,7 +2906,10 @@ def main() -> None:
     _anim_sheet = pygame.image.load(_anim_sheet_path).convert_alpha() if _anim_sheet_path else None
     _lsheet_path = find_file(dir_map, "LeftAnimatons.png")
     _rsheet_path = find_file(dir_map, "RightAnimations.png")
-    _gritty_sheet_path = find_file(dir_map, "OnyxG_Gritty_Sprite_Sheet.png")
+    # Prefer the darker V2 art explicitly. Never silently pretend V2 is loaded.
+    _gritty_v2_path = find_file(dir_map, "OnyxG_Gritty_Sprite_Sheet_v2.png")
+    _gritty_v1_path = find_file(dir_map, "OnyxG_Gritty_Sprite_Sheet.png")
+    _gritty_sheet_path = _gritty_v2_path or _gritty_v1_path
     _movement_sheet_path = find_file(dir_map, "OnyxG_Movement_Sprite_Sheet.png")
     _lsheet = pygame.image.load(_lsheet_path).convert_alpha() if _lsheet_path else None
     _rsheet = pygame.image.load(_rsheet_path).convert_alpha() if _rsheet_path else None
@@ -2919,9 +2922,20 @@ def main() -> None:
         if _movement_sheet_path else None
     )
     if _gritty_sheet is not None:
-        print("🎭 Gritty Onyx G sprite sheet loaded.")
+        _loaded_gritty_name = os.path.basename(_gritty_sheet_path)
+        print(
+            f"🎭 ONYX G ART SOURCE: {_loaded_gritty_name} "
+            f"{_gritty_sheet.get_width()}x{_gritty_sheet.get_height()}"
+        )
+        if _gritty_v2_path:
+            print("✅ DARKER V2 ONYX G SHEET IS ACTIVE.")
+        else:
+            print("⚠️ V2 SHEET NOT FOUND — USING ORIGINAL GRITTY SHEET.")
     if _movement_sheet is not None:
-        print("🏃 Onyx G movement sprite sheet loaded.")
+        print(
+            f"🏃 MOVEMENT SOURCE: {os.path.basename(_movement_sheet_path)} "
+            f"{_movement_sheet.get_width()}x{_movement_sheet.get_height()}"
+        )
     player_animator = PlayerSpriteAnimator(
         sprite_idle_image, sprite_shoot_image,
         sheet=_anim_sheet, lsheet=_lsheet, rsheet=_rsheet,
