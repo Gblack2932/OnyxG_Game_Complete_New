@@ -42,6 +42,31 @@ except Exception:
 class _SDL2GamepadAdapter:
     """Joystick-compatible wrapper around SDL2's standardized game-controller API."""
 
+    # SDL_GameControllerAxis enum indices.
+    AXIS_LEFTX = 0
+    AXIS_LEFTY = 1
+    AXIS_RIGHTX = 2
+    AXIS_RIGHTY = 3
+    AXIS_TRIGGERLEFT = 4
+    AXIS_TRIGGERRIGHT = 5
+
+    # SDL_GameControllerButton enum indices.
+    BTN_A = 0
+    BTN_B = 1
+    BTN_X = 2
+    BTN_Y = 3
+    BTN_BACK = 4
+    BTN_GUIDE = 5
+    BTN_START = 6
+    BTN_LEFTSTICK = 7
+    BTN_RIGHTSTICK = 8
+    BTN_LEFTSHOULDER = 9
+    BTN_RIGHTSHOULDER = 10
+    BTN_DPAD_UP = 11
+    BTN_DPAD_DOWN = 12
+    BTN_DPAD_LEFT = 13
+    BTN_DPAD_RIGHT = 14
+
     def __init__(self, pad) -> None:
         self._pad = pad
         self._joy = pad.as_joystick()
@@ -62,71 +87,45 @@ class _SDL2GamepadAdapter:
         return 6
 
     def get_numbuttons(self):
-        # Expose a joystick-like layout expected by the existing game code.
         return 15
 
     def get_numhats(self):
         return 1
 
-    def _axis(self, constant):
+    def _axis(self, index):
         try:
-            value = self._pad.get_axis(constant)
+            value = self._pad.get_axis(index)
         except Exception:
             return 0.0
-        if constant in (
-            sdl2_controller.CONTROLLER_AXIS_TRIGGERLEFT,
-            sdl2_controller.CONTROLLER_AXIS_TRIGGERRIGHT,
-        ):
-            return max(0.0, min(1.0, value / 32768.0))
-        return max(-1.0, min(1.0, value / 32767.0))
+        if index in (self.AXIS_TRIGGERLEFT, self.AXIS_TRIGGERRIGHT):
+            # SDL controller triggers rest at 0 and rise toward +32767.
+            return max(0.0, min(1.0, float(value) / 32767.0))
+        return max(-1.0, min(1.0, float(value) / 32767.0))
 
     def get_axis(self, index):
-        mapping = {
-            0: sdl2_controller.CONTROLLER_AXIS_LEFTX,
-            1: sdl2_controller.CONTROLLER_AXIS_LEFTY,
-            2: sdl2_controller.CONTROLLER_AXIS_RIGHTX,
-            3: sdl2_controller.CONTROLLER_AXIS_RIGHTY,
-            4: sdl2_controller.CONTROLLER_AXIS_TRIGGERLEFT,
-            5: sdl2_controller.CONTROLLER_AXIS_TRIGGERRIGHT,
-        }
-        constant = mapping.get(index)
-        return self._axis(constant) if constant is not None else 0.0
+        if 0 <= index <= 5:
+            return self._axis(index)
+        return 0.0
 
-    def _button(self, constant):
+    def _button(self, index):
         try:
-            return bool(self._pad.get_button(constant))
+            return bool(self._pad.get_button(index))
         except Exception:
             return False
 
     def get_button(self, index):
-        # Existing game indices plus compatibility aliases.
-        mapping = {
-            0: sdl2_controller.CONTROLLER_BUTTON_A,
-            1: sdl2_controller.CONTROLLER_BUTTON_B,
-            2: sdl2_controller.CONTROLLER_BUTTON_X,
-            3: sdl2_controller.CONTROLLER_BUTTON_Y,
-            4: sdl2_controller.CONTROLLER_BUTTON_LEFTSHOULDER,
-            5: sdl2_controller.CONTROLLER_BUTTON_RIGHTSHOULDER,
-            6: sdl2_controller.CONTROLLER_BUTTON_BACK,
-            7: sdl2_controller.CONTROLLER_BUTTON_START,
-            8: sdl2_controller.CONTROLLER_BUTTON_GUIDE,
-            9: sdl2_controller.CONTROLLER_BUTTON_LEFTSHOULDER,
-            10: sdl2_controller.CONTROLLER_BUTTON_RIGHTSHOULDER,
-            11: sdl2_controller.CONTROLLER_BUTTON_DPAD_UP,
-            12: sdl2_controller.CONTROLLER_BUTTON_DPAD_DOWN,
-            13: sdl2_controller.CONTROLLER_BUTTON_DPAD_LEFT,
-            14: sdl2_controller.CONTROLLER_BUTTON_DPAD_RIGHT,
-        }
-        constant = mapping.get(index)
-        return self._button(constant) if constant is not None else False
+        # Existing game indices map directly to the standardized SDL buttons.
+        if 0 <= index <= 14:
+            return self._button(index)
+        return False
 
     def get_hat(self, index):
         if index != 0:
             return (0, 0)
-        x = int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_RIGHT))
-        x -= int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_LEFT))
-        y = int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_UP))
-        y -= int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_DOWN))
+        x = int(self._button(self.BTN_DPAD_RIGHT))
+        x -= int(self._button(self.BTN_DPAD_LEFT))
+        y = int(self._button(self.BTN_DPAD_UP))
+        y -= int(self._button(self.BTN_DPAD_DOWN))
         return (x, y)
 
 
@@ -4504,7 +4503,7 @@ def main() -> None:
                     event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT
                 ) or (
                     event.type == pygame.JOYBUTTONDOWN
-                    and _joy is not None and event.button in (4, 9)  # LB: raw or SDL-style
+                    and _joy is not None and event.button in (4, 9)  # raw fallback or SDL LB
                 )
                 if (_do_burst and signal_meter >= signal_max and not show_upgrade
                         and continue_timer == 0):
@@ -4767,8 +4766,8 @@ def main() -> None:
                     or (
                         _joy is not None
                         and (
-                            (_joy.get_numbuttons() > 5 and _joy.get_button(5))
-                            or (_joy.get_numbuttons() > 10 and _joy.get_button(10))
+                            (_joy.get_numbuttons() > 10 and _joy.get_button(10))
+                            or (_sdl_gamepad is None and _joy.get_numbuttons() > 5 and _joy.get_button(5))
                         )
                     )
                 )  # RB: supports raw and SDL-style macOS mappings
