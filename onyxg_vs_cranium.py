@@ -33,6 +33,102 @@ from typing import List, Dict, Tuple, Optional, Any
 
 import pygame
 
+try:
+    from pygame._sdl2 import controller as sdl2_controller
+except Exception:
+    sdl2_controller = None
+
+
+class _SDL2GamepadAdapter:
+    """Joystick-compatible wrapper around SDL2's standardized game-controller API."""
+
+    def __init__(self, pad) -> None:
+        self._pad = pad
+        self._joy = pad.as_joystick()
+
+    def get_name(self):
+        try:
+            return self._joy.get_name()
+        except pygame.error:
+            return "SDL2 Game Controller"
+
+    def get_instance_id(self):
+        try:
+            return self._joy.get_instance_id()
+        except pygame.error:
+            return -1
+
+    def get_numaxes(self):
+        return 6
+
+    def get_numbuttons(self):
+        # Expose a joystick-like layout expected by the existing game code.
+        return 15
+
+    def get_numhats(self):
+        return 1
+
+    def _axis(self, constant):
+        try:
+            value = self._pad.get_axis(constant)
+        except Exception:
+            return 0.0
+        if constant in (
+            sdl2_controller.CONTROLLER_AXIS_TRIGGERLEFT,
+            sdl2_controller.CONTROLLER_AXIS_TRIGGERRIGHT,
+        ):
+            return max(0.0, min(1.0, value / 32768.0))
+        return max(-1.0, min(1.0, value / 32767.0))
+
+    def get_axis(self, index):
+        mapping = {
+            0: sdl2_controller.CONTROLLER_AXIS_LEFTX,
+            1: sdl2_controller.CONTROLLER_AXIS_LEFTY,
+            2: sdl2_controller.CONTROLLER_AXIS_RIGHTX,
+            3: sdl2_controller.CONTROLLER_AXIS_RIGHTY,
+            4: sdl2_controller.CONTROLLER_AXIS_TRIGGERLEFT,
+            5: sdl2_controller.CONTROLLER_AXIS_TRIGGERRIGHT,
+        }
+        constant = mapping.get(index)
+        return self._axis(constant) if constant is not None else 0.0
+
+    def _button(self, constant):
+        try:
+            return bool(self._pad.get_button(constant))
+        except Exception:
+            return False
+
+    def get_button(self, index):
+        # Existing game indices plus compatibility aliases.
+        mapping = {
+            0: sdl2_controller.CONTROLLER_BUTTON_A,
+            1: sdl2_controller.CONTROLLER_BUTTON_B,
+            2: sdl2_controller.CONTROLLER_BUTTON_X,
+            3: sdl2_controller.CONTROLLER_BUTTON_Y,
+            4: sdl2_controller.CONTROLLER_BUTTON_LEFTSHOULDER,
+            5: sdl2_controller.CONTROLLER_BUTTON_RIGHTSHOULDER,
+            6: sdl2_controller.CONTROLLER_BUTTON_BACK,
+            7: sdl2_controller.CONTROLLER_BUTTON_START,
+            8: sdl2_controller.CONTROLLER_BUTTON_GUIDE,
+            9: sdl2_controller.CONTROLLER_BUTTON_LEFTSHOULDER,
+            10: sdl2_controller.CONTROLLER_BUTTON_RIGHTSHOULDER,
+            11: sdl2_controller.CONTROLLER_BUTTON_DPAD_UP,
+            12: sdl2_controller.CONTROLLER_BUTTON_DPAD_DOWN,
+            13: sdl2_controller.CONTROLLER_BUTTON_DPAD_LEFT,
+            14: sdl2_controller.CONTROLLER_BUTTON_DPAD_RIGHT,
+        }
+        constant = mapping.get(index)
+        return self._button(constant) if constant is not None else False
+
+    def get_hat(self, index):
+        if index != 0:
+            return (0, 0)
+        x = int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_RIGHT))
+        x -= int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_LEFT))
+        y = int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_UP))
+        y -= int(self._button(sdl2_controller.CONTROLLER_BUTTON_DPAD_DOWN))
+        return (x, y)
+
 
 import constants as cfg
 from entities import (
@@ -2819,8 +2915,34 @@ def main() -> None:
     pygame.init()
     # ── Xbox / gamepad controller support ─────────────────────────────────────
     pygame.joystick.init()
-    _joy = None   # active controller; switches to whichever device actually sends input
+    _joy = None
     _joysticks = {}
+    _sdl_gamepad = None
+
+    # Prefer SDL2's standardized GameController API. This avoids macOS exposing
+    # one Xbox pad through multiple raw joystick layouts.
+    if sdl2_controller is not None:
+        try:
+            sdl2_controller.init()
+            sdl2_controller.set_eventstate(True)
+            for _ci in range(sdl2_controller.get_count()):
+                if sdl2_controller.is_controller(_ci):
+                    _pad = sdl2_controller.Controller(_ci)
+                    _sdl_gamepad = _SDL2GamepadAdapter(_pad)
+                    _joy = _sdl_gamepad
+                    print(
+                        f"🎮 SDL2 Xbox controller ready: {_joy.get_name()} "
+                        f"(instance={_joy.get_instance_id()})"
+                    )
+                    try:
+                        print(f"🎮 SDL2 mapping: {_pad.get_mapping()}")
+                    except Exception:
+                        pass
+                    break
+        except Exception as _controller_err:
+            print(f"🎮 SDL2 controller fallback: {_controller_err}")
+            _sdl_gamepad = None
+            _joy = None
 
     def _refresh_joysticks():
         nonlocal _joy
@@ -2831,43 +2953,32 @@ def main() -> None:
                 _js.init()
                 _joysticks[_js.get_instance_id()] = _js
                 print(
-                    f"🎮 Controller {_ji}: {_js.get_name()} "
+                    f"🎮 Raw joystick {_ji}: {_js.get_name()} "
                     f"(instance={_js.get_instance_id()}, axes={_js.get_numaxes()}, "
                     f"buttons={_js.get_numbuttons()}, hats={_js.get_numhats()})"
                 )
             except pygame.error:
                 pass
-        if _joysticks:
-            def _controller_score(_js):
-                # On macOS one Xbox pad can appear twice. The SDL-style
-                # interface normally exposes a D-pad hat and ~6 axes.
-                _score = 0
-                if _js.get_numhats() > 0:
-                    _score += 100
-                if _js.get_numaxes() == 6:
-                    _score += 30
-                if 10 <= _js.get_numbuttons() <= 16:
-                    _score += 20
-                if _js.get_name().strip().lower() == "controller":
-                    _score += 10
-                return _score
 
-            _joy = max(_joysticks.values(), key=_controller_score)
-            print(
-                f"🎮 Preferred controller: {_joy.get_name()} "
-                f"(instance={_joy.get_instance_id()}, axes={_joy.get_numaxes()}, "
-                f"buttons={_joy.get_numbuttons()}, hats={_joy.get_numhats()})"
-            )
+        # Only choose a raw joystick if SDL2 GameController was unavailable.
+        if _sdl_gamepad is None and _joysticks:
+            _joy = next(iter(_joysticks.values()))
+            print(f"🎮 Using raw joystick fallback: {_joy.get_name()}")
 
     def _activate_joy_from_event(event):
         nonlocal _joy
+        # Never replace the standardized SDL2 controller with a duplicate raw
+        # joystick interface on macOS.
+        if _sdl_gamepad is not None:
+            _joy = _sdl_gamepad
+            return
         _iid = getattr(event, 'instance_id', None)
         if _iid is None:
             _iid = getattr(event, 'joy', None)
         _candidate = _joysticks.get(_iid)
         if _candidate is not None and _candidate is not _joy:
             _joy = _candidate
-            print(f"🎮 Active controller switched to: {_joy.get_name()} (instance={_iid})")
+            print(f"🎮 Active raw joystick switched to: {_joy.get_name()} (instance={_iid})")
 
     _refresh_joysticks()
     impact_channel   = pygame.mixer.Channel(0)  # ch 0: enemy/player hits — never dropped
@@ -4318,7 +4429,11 @@ def main() -> None:
                     _removed = getattr(event, 'instance_id', None)
                     if _removed in _joysticks:
                         _joysticks.pop(_removed, None)
-                    if _joy is not None and getattr(_joy, 'get_instance_id', lambda: None)() == _removed:
+                    if (
+                        _sdl_gamepad is None
+                        and _joy is not None
+                        and getattr(_joy, 'get_instance_id', lambda: None)() == _removed
+                    ):
                         _joy = None
                     _refresh_joysticks()
                     print("🎮 Controller disconnected.")
