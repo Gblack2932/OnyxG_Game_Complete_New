@@ -2870,8 +2870,6 @@ def main() -> None:
         if _candidate is not None:
             _joy = _candidate
 
-    _refresh_joysticks()
-
     impact_channel   = pygame.mixer.Channel(0)  # ch 0: enemy/player hits — never dropped
     burst_channel    = pygame.mixer.Channel(1)  # ch 1: signal burst punch
     run_channel      = pygame.mixer.Channel(2)  # ch 2: run footsteps (looping)
@@ -2882,6 +2880,12 @@ def main() -> None:
     screen_bounds = pygame.Rect(0, 0, WIDTH, HEIGHT)
     pygame.display.set_caption("Onyx G vs Space Drones")
     clock = pygame.time.Clock()
+
+    # macOS raw Xbox fallback is not reliably enumerable until the video
+    # subsystem/window exists. Pump once, then enumerate exactly like the
+    # working controller_test.py diagnostic.
+    pygame.event.pump()
+    _refresh_joysticks()
 
     dir_map = _build_dir_map()
 
