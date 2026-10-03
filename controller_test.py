@@ -1,4 +1,9 @@
+import os
 import sys
+
+# Force SDL to use the macOS fallback joystick/MFi path instead of HIDAPI.
+os.environ.setdefault("SDL_JOYSTICK_HIDAPI", "0")
+
 import pygame
 
 pygame.init()
@@ -25,7 +30,8 @@ def snapshot(js):
 def open_joysticks():
     found = []
     count = pygame.joystick.get_count()
-    print(f"\nPygame {pygame.version.ver}")
+    print(f"\nPygame {pygame.version.ver} / SDL {pygame.get_sdl_version()}")
+    print("SDL_JOYSTICK_HIDAPI =", os.environ.get("SDL_JOYSTICK_HIDAPI"))
     print(f"Joystick count: {count}")
     for i in range(count):
         js = pygame.joystick.Joystick(i)
