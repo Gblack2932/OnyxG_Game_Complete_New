@@ -33,104 +33,6 @@ from typing import List, Dict, Tuple, Optional, Any
 
 import pygame
 
-try:
-    from pygame._sdl2 import controller as sdl2_controller
-except Exception:
-    sdl2_controller = None
-
-
-class _SDL2GamepadAdapter:
-    """Joystick-compatible wrapper around SDL2's standardized game-controller API."""
-
-    def __init__(self, pad) -> None:
-        self._pad = pad
-        self._joy = pad.as_joystick()
-
-    def get_name(self):
-        try:
-            return self._joy.get_name()
-        except pygame.error:
-            return "SDL2 Game Controller"
-
-    def get_instance_id(self):
-        try:
-            return self._joy.get_instance_id()
-        except pygame.error:
-            return -1
-
-    def get_numaxes(self):
-        return 6
-
-    def get_numbuttons(self):
-        return 15
-
-    def get_numhats(self):
-        return 1
-
-    def _axis(self, constant):
-        try:
-            value = self._pad.get_axis(constant)
-        except Exception:
-            return 0.0
-
-        if constant in (
-            pygame.CONTROLLER_AXIS_TRIGGERLEFT,
-            pygame.CONTROLLER_AXIS_TRIGGERRIGHT,
-        ):
-            return max(0.0, min(1.0, float(value) / 32768.0))
-
-        return max(-1.0, min(1.0, float(value) / 32767.0))
-
-    def get_axis(self, index):
-        mapping = {
-            0: pygame.CONTROLLER_AXIS_LEFTX,
-            1: pygame.CONTROLLER_AXIS_LEFTY,
-            2: pygame.CONTROLLER_AXIS_RIGHTX,
-            3: pygame.CONTROLLER_AXIS_RIGHTY,
-            4: pygame.CONTROLLER_AXIS_TRIGGERLEFT,
-            5: pygame.CONTROLLER_AXIS_TRIGGERRIGHT,
-        }
-        constant = mapping.get(index)
-        return self._axis(constant) if constant is not None else 0.0
-
-    def _button(self, constant):
-        try:
-            return bool(self._pad.get_button(constant))
-        except Exception:
-            return False
-
-    def get_button(self, index):
-        mapping = {
-            0: pygame.CONTROLLER_BUTTON_A,
-            1: pygame.CONTROLLER_BUTTON_B,
-            2: pygame.CONTROLLER_BUTTON_X,
-            3: pygame.CONTROLLER_BUTTON_Y,
-            4: pygame.CONTROLLER_BUTTON_BACK,
-            5: pygame.CONTROLLER_BUTTON_GUIDE,
-            6: pygame.CONTROLLER_BUTTON_START,
-            7: pygame.CONTROLLER_BUTTON_LEFTSTICK,
-            8: pygame.CONTROLLER_BUTTON_RIGHTSTICK,
-            9: pygame.CONTROLLER_BUTTON_LEFTSHOULDER,
-            10: pygame.CONTROLLER_BUTTON_RIGHTSHOULDER,
-            11: pygame.CONTROLLER_BUTTON_DPAD_UP,
-            12: pygame.CONTROLLER_BUTTON_DPAD_DOWN,
-            13: pygame.CONTROLLER_BUTTON_DPAD_LEFT,
-            14: pygame.CONTROLLER_BUTTON_DPAD_RIGHT,
-        }
-        constant = mapping.get(index)
-        return self._button(constant) if constant is not None else False
-
-    def get_hat(self, index):
-        if index != 0:
-            return (0, 0)
-
-        x = int(self._button(pygame.CONTROLLER_BUTTON_DPAD_RIGHT))
-        x -= int(self._button(pygame.CONTROLLER_BUTTON_DPAD_LEFT))
-        y = int(self._button(pygame.CONTROLLER_BUTTON_DPAD_UP))
-        y -= int(self._button(pygame.CONTROLLER_BUTTON_DPAD_DOWN))
-        return (x, y)
-
-
 import constants as cfg
 from entities import (
     Enemy, BossMinionEnemy, Bullet, SideBullet, AimedBullet, BossBullet,
@@ -2915,35 +2817,11 @@ def main() -> None:
                           cfg.AUDIO_INIT_CHANNELS, cfg.AUDIO_INIT_BUFFER)
     pygame.init()
     # ── Xbox / gamepad controller support ─────────────────────────────────────
+    # On macOS this Xbox Series X pad works reliably through pygame.joystick
+    # when SDL HIDAPI is disabled in main.py. Use that proven raw backend only.
     pygame.joystick.init()
     _joy = None
     _joysticks = {}
-    _sdl_gamepad = None
-
-    # Prefer SDL2's standardized GameController API. This avoids macOS exposing
-    # one Xbox pad through multiple raw joystick layouts.
-    if sdl2_controller is not None:
-        try:
-            sdl2_controller.init()
-            sdl2_controller.set_eventstate(True)
-            for _ci in range(sdl2_controller.get_count()):
-                if sdl2_controller.is_controller(_ci):
-                    _pad = sdl2_controller.Controller(_ci)
-                    _sdl_gamepad = _SDL2GamepadAdapter(_pad)
-                    _joy = _sdl_gamepad
-                    print(
-                        f"🎮 SDL2 Xbox controller ready: {_joy.get_name()} "
-                        f"(instance={_joy.get_instance_id()})"
-                    )
-                    try:
-                        print(f"🎮 SDL2 mapping: {_pad.get_mapping()}")
-                    except Exception:
-                        pass
-                    break
-        except Exception as _controller_err:
-            print(f"🎮 SDL2 controller fallback: {_controller_err}")
-            _sdl_gamepad = None
-            _joy = None
 
     def _refresh_joysticks():
         nonlocal _joy
@@ -2954,34 +2832,46 @@ def main() -> None:
                 _js.init()
                 _joysticks[_js.get_instance_id()] = _js
                 print(
-                    f"🎮 Raw joystick {_ji}: {_js.get_name()} "
+                    f"🎮 Raw controller {_ji}: {_js.get_name()} "
                     f"(instance={_js.get_instance_id()}, axes={_js.get_numaxes()}, "
                     f"buttons={_js.get_numbuttons()}, hats={_js.get_numhats()})"
                 )
             except pygame.error:
                 pass
 
-        # Only choose a raw joystick if SDL2 GameController was unavailable.
-        if _sdl_gamepad is None and _joysticks:
-            _joy = next(iter(_joysticks.values()))
-            print(f"🎮 Using raw joystick fallback: {_joy.get_name()}")
+        if _joysticks:
+            # HIDAPI-off test exposes one working controller named "Controller".
+            # Prefer a device with a D-pad hat, then the one with 6 axes.
+            def _score(_js):
+                score = 0
+                if _js.get_numhats() > 0:
+                    score += 100
+                if _js.get_numaxes() == 6:
+                    score += 30
+                if _js.get_name().strip().lower() == "controller":
+                    score += 20
+                return score
+
+            _joy = max(_joysticks.values(), key=_score)
+            print(
+                f"🎮 Using raw Xbox controller: {_joy.get_name()} "
+                f"(instance={_joy.get_instance_id()})"
+            )
+        else:
+            _joy = None
+            print("🎮 No raw controller detected.")
 
     def _activate_joy_from_event(event):
         nonlocal _joy
-        # Never replace the standardized SDL2 controller with a duplicate raw
-        # joystick interface on macOS.
-        if _sdl_gamepad is not None:
-            _joy = _sdl_gamepad
-            return
         _iid = getattr(event, 'instance_id', None)
         if _iid is None:
             _iid = getattr(event, 'joy', None)
         _candidate = _joysticks.get(_iid)
-        if _candidate is not None and _candidate is not _joy:
+        if _candidate is not None:
             _joy = _candidate
-            print(f"🎮 Active raw joystick switched to: {_joy.get_name()} (instance={_iid})")
 
     _refresh_joysticks()
+
     impact_channel   = pygame.mixer.Channel(0)  # ch 0: enemy/player hits — never dropped
     burst_channel    = pygame.mixer.Channel(1)  # ch 1: signal burst punch
     run_channel      = pygame.mixer.Channel(2)  # ch 2: run footsteps (looping)
@@ -4431,8 +4321,7 @@ def main() -> None:
                     if _removed in _joysticks:
                         _joysticks.pop(_removed, None)
                     if (
-                        _sdl_gamepad is None
-                        and _joy is not None
+                        _joy is not None
                         and getattr(_joy, 'get_instance_id', lambda: None)() == _removed
                     ):
                         _joy = None
@@ -4471,7 +4360,7 @@ def main() -> None:
                     event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                 ) or (
                     event.type == pygame.JOYBUTTONDOWN
-                    and _joy is not None and event.button in (1, 6, 7)  # B or Start/Menu
+                    and _joy is not None and event.button in (1, 6)  # B or Start
                 )
                 if _toggle_pause and not show_upgrade and continue_timer == 0:
                     append_replay_event(replay_events, frame_count, 'pause_open')
@@ -4505,7 +4394,7 @@ def main() -> None:
                     event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT
                 ) or (
                     event.type == pygame.JOYBUTTONDOWN
-                    and _joy is not None and event.button in (4, 9)  # raw fallback or SDL LB
+                    and _joy is not None and event.button == 9  # LB on proven raw Xbox mapping
                 )
                 if (_do_burst and signal_meter >= signal_max and not show_upgrade
                         and continue_timer == 0):
@@ -4734,7 +4623,11 @@ def main() -> None:
                 shoot_pose_timer = max(0, shoot_pose_timer - 1)
                 side_shoot_pose_timer = max(0, side_shoot_pose_timer - 1)
                 # Space = shoot up.
-                _fire_held = keys[pygame.K_SPACE] or (_joy is not None and _joy.get_axis(5) > 0.20)
+                _fire_held = keys[pygame.K_SPACE] or (
+                    _joy is not None
+                    and _joy.get_numaxes() > 5
+                    and _joy.get_axis(5) > -0.35
+                )
                 if _fire_held and len(fireballs) < 20 and fire_timer == 0:
                     shoot_pose_timer = SHOOT_POSE_FRAMES
                     if perk_double_shot or sativa_active:
@@ -4769,7 +4662,6 @@ def main() -> None:
                         _joy is not None
                         and (
                             (_joy.get_numbuttons() > 10 and _joy.get_button(10))
-                            or (_sdl_gamepad is None and _joy.get_numbuttons() > 5 and _joy.get_button(5))
                         )
                     )
                 )  # RB: supports raw and SDL-style macOS mappings
