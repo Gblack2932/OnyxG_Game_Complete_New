@@ -5456,7 +5456,9 @@ def main() -> None:
             elif beat_pulse > 0:
                 _rim_col = (255, 215, 70, 125)
             else:
-                _rim_col = (55, 205, 255, 100)
+                # Keep the normal rim subtle; the sprite itself should carry the
+                # visual weight instead of looking like a translucent hologram.
+                _rim_col = (55, 180, 220, 58)
             _rim_key = (current_pose_key, _draw_img.get_size(), _rim_col)
             if _rim_key not in _player_outline_cache:
                 # Clear BEFORE inserting so the current rim can never be deleted
@@ -5473,6 +5475,17 @@ def main() -> None:
                 _player_outline_cache[_rim_key] = pygame.transform.smoothscale(
                     _rim_src, (_rw, _rh))
             _rim_img = _player_outline_cache[_rim_key]
+
+            # Solid underpaint: fill the sprite silhouette with a deep near-black
+            # before drawing the art. This removes the washed/see-through look
+            # against bright backgrounds without touching the hitbox or animation.
+            _solid_mask = pygame.mask.from_surface(_draw_img, 8)
+            _solid_back = _solid_mask.to_surface(
+                setcolor=(8, 8, 14, 255),
+                unsetcolor=(0, 0, 0, 0),
+            ).convert_alpha()
+            screen.blit(_solid_back, _solid_back.get_rect(center=_draw_rect.center))
+
             screen.blit(_rim_img, _rim_img.get_rect(center=_draw_rect.center))
             screen.blit(_draw_img, _draw_rect)
 
