@@ -1279,7 +1279,8 @@ def _make_countdown_tick_sound() -> pygame.mixer.Sound:
 
 def _tutorial_screen(screen: pygame.Surface, clock: pygame.time.Clock, 
                     tutorial_img: List[pygame.Surface], 
-                    tutorial_music_file: Optional[str] = None) -> None:
+                    tutorial_music_file: Optional[str] = None,
+                    controller=None) -> None:
     """
     Display tutorial/instructions screen.
     
@@ -1300,6 +1301,9 @@ def _tutorial_screen(screen: pygame.Surface, clock: pygame.time.Clock,
     if not pages:
         return
     page_idx = 0
+    _pad_a_prev = False
+    _pad_b_prev = False
+    _pad_nav_cooldown = 0
 
     def _hint_surface(idx):
         if len(pages) == 1:
@@ -1354,6 +1358,38 @@ def _tutorial_screen(screen: pygame.Surface, clock: pygame.time.Clock,
                     page_idx += 1
                 else:
                     return
+
+        if controller is not None:
+            try:
+                if _pad_nav_cooldown > 0:
+                    _pad_nav_cooldown -= 1
+                _hx = controller.get_hat(0)[0] if controller.get_numhats() > 0 else 0
+                if _hx == 0 and controller.get_numaxes() > 0:
+                    _ax = controller.get_axis(0)
+                    if _ax < -0.65:
+                        _hx = -1
+                    elif _ax > 0.65:
+                        _hx = 1
+                if _hx != 0 and _pad_nav_cooldown == 0:
+                    if _hx > 0:
+                        page_idx = min(len(pages) - 1, page_idx + 1)
+                    else:
+                        page_idx = max(0, page_idx - 1)
+                    _pad_nav_cooldown = 10
+
+                _pad_a = controller.get_numbuttons() > 0 and bool(controller.get_button(0))
+                _pad_b = controller.get_numbuttons() > 1 and bool(controller.get_button(1))
+                if _pad_a and not _pad_a_prev:
+                    if len(pages) > 1 and page_idx < len(pages) - 1:
+                        page_idx += 1
+                    else:
+                        return
+                if _pad_b and not _pad_b_prev:
+                    return
+                _pad_a_prev = _pad_a
+                _pad_b_prev = _pad_b
+            except pygame.error:
+                pass
 
         pygame.display.flip()
         clock.tick(60)
@@ -1466,7 +1502,7 @@ def _get_arcade_font(size):
 
 
 def _start_menu(screen, clock, menu_img, menu_music_file=None,
-                tutorial_img=None, tutorial_music_file=None):
+                tutorial_img=None, tutorial_music_file=None, controller=None):
     if menu_music_file:
         try:
             pygame.mixer.music.load(menu_music_file)
@@ -1503,6 +1539,8 @@ def _start_menu(screen, clock, menu_img, menu_music_file=None,
     font_btn  = _get_arcade_font(16)
     soon_timer = 0
     selected = 0
+    _pad_a_prev = False
+    _pad_nav_cooldown = 0
     highlight  = pygame.Surface((btn_w, btn_h), pygame.SRCALPHA)
     highlight.fill((255, 255, 255, 55))
 
@@ -1588,6 +1626,46 @@ def _start_menu(screen, clock, menu_img, menu_music_file=None,
                             pass
                 else:
                     soon_timer = 120
+
+        # Direct polling fallback for macOS Xbox pads that do not emit the
+        # expected JOYBUTTONDOWN/JOYHATMOTION events through both logical devices.
+        if controller is not None:
+            try:
+                if _pad_nav_cooldown > 0:
+                    _pad_nav_cooldown -= 1
+                _nav_y = 0
+                if controller.get_numhats() > 0:
+                    _nav_y = controller.get_hat(0)[1]
+                if _nav_y == 0 and controller.get_numaxes() > 1:
+                    _ay = controller.get_axis(1)
+                    if _ay < -0.65:
+                        _nav_y = 1
+                    elif _ay > 0.65:
+                        _nav_y = -1
+                if _nav_y != 0 and _pad_nav_cooldown == 0:
+                    selected = (selected - 1) % len(buttons) if _nav_y > 0 else (selected + 1) % len(buttons)
+                    _pad_nav_cooldown = 10
+
+                _pad_a = controller.get_numbuttons() > 0 and bool(controller.get_button(0))
+                if _pad_a and not _pad_a_prev:
+                    _action = buttons[selected][1]
+                    if _action == "start":
+                        return
+                    elif _action == "exit":
+                        pygame.quit()
+                        sys.exit()
+                    elif _action == "tutorial" and tutorial_img is not None:
+                        _tutorial_screen(
+                            screen, clock, tutorial_img, tutorial_music_file,
+                            controller=controller,
+                        )
+                    elif _action == "credits":
+                        _credits_screen(screen, clock)
+                    else:
+                        soon_timer = 120
+                _pad_a_prev = _pad_a
+            except pygame.error:
+                pass
 
         pygame.display.flip()
         clock.tick(60)
@@ -2759,8 +2837,27 @@ def main() -> None:
                 )
             except pygame.error:
                 pass
-        if _joy is None and _joysticks:
-            _joy = next(iter(_joysticks.values()))
+        if _joysticks:
+            def _controller_score(_js):
+                # On macOS one Xbox pad can appear twice. The SDL-style
+                # interface normally exposes a D-pad hat and ~6 axes.
+                _score = 0
+                if _js.get_numhats() > 0:
+                    _score += 100
+                if _js.get_numaxes() == 6:
+                    _score += 30
+                if 10 <= _js.get_numbuttons() <= 16:
+                    _score += 20
+                if _js.get_name().strip().lower() == "controller":
+                    _score += 10
+                return _score
+
+            _joy = max(_joysticks.values(), key=_controller_score)
+            print(
+                f"🎮 Preferred controller: {_joy.get_name()} "
+                f"(instance={_joy.get_instance_id()}, axes={_joy.get_numaxes()}, "
+                f"buttons={_joy.get_numbuttons()}, hats={_joy.get_numhats()})"
+            )
 
     def _activate_joy_from_event(event):
         nonlocal _joy
@@ -3455,10 +3552,11 @@ def main() -> None:
 
     # ── Start menu (shown once on launch) ─────────────────────────────────
     _start_menu(screen, clock, menu_img, start_menu_music_file,
-                tutorial_img=tutorial_img, tutorial_music_file=tutorial_music_file)
+                tutorial_img=tutorial_img, tutorial_music_file=tutorial_music_file,
+                controller=_joy)
 
     # ── Tutorial screen (shown automatically after START GAME) ────────────
-    _tutorial_screen(screen, clock, tutorial_img, tutorial_music_file)
+    _tutorial_screen(screen, clock, tutorial_img, tutorial_music_file, controller=_joy)
 
     if music_file:
         try:
@@ -4257,7 +4355,7 @@ def main() -> None:
                     event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
                 ) or (
                     event.type == pygame.JOYBUTTONDOWN
-                    and _joy is not None and event.button in (1, 7)  # B or Start
+                    and _joy is not None and event.button in (1, 6, 7)  # B or Start/Menu
                 )
                 if _toggle_pause and not show_upgrade and continue_timer == 0:
                     append_replay_event(replay_events, frame_count, 'pause_open')
@@ -4291,7 +4389,7 @@ def main() -> None:
                     event.type == pygame.KEYDOWN and event.key == pygame.K_LSHIFT
                 ) or (
                     event.type == pygame.JOYBUTTONDOWN
-                    and _joy is not None and event.button == 4  # LB
+                    and _joy is not None and event.button in (4, 9)  # LB: raw or SDL-style
                 )
                 if (_do_burst and signal_meter >= signal_max and not show_upgrade
                         and continue_timer == 0):
@@ -4442,8 +4540,14 @@ def main() -> None:
                     _jx = _joy.get_axis(0); _jy = _joy.get_axis(1)
                     if abs(_jx) < _DEAD: _jx = 0.0
                     if abs(_jy) < _DEAD: _jy = 0.0
-                    # D-pad (buttons 11-14 on Xbox Series X + macOS SDL2)
-                    if _joy.get_numbuttons() > 14:
+                    # D-pad: the preferred macOS SDL interface exposes a hat.
+                    if _joy.get_numhats() > 0:
+                        _hx, _hy = _joy.get_hat(0)
+                        if _hy > 0:   _jy = -1.0
+                        elif _hy < 0: _jy =  1.0
+                        if _hx < 0:   _jx = -1.0
+                        elif _hx > 0: _jx =  1.0
+                    elif _joy.get_numbuttons() > 14:
                         if _joy.get_button(11):   _jy = -1.0
                         elif _joy.get_button(12): _jy =  1.0
                         if _joy.get_button(13):   _jx = -1.0
@@ -4543,8 +4647,16 @@ def main() -> None:
                         shoot_sound.play()
                 # Command = shoot sideways. The pose follows horizontal movement,
                 # or alternates sides while the player is standing still.
-                _cmd = (keys[pygame.K_LMETA] or keys[pygame.K_RMETA]
-                        or (_joy is not None and _joy.get_button(5)))  # RB
+                _cmd = (
+                    keys[pygame.K_LMETA] or keys[pygame.K_RMETA]
+                    or (
+                        _joy is not None
+                        and (
+                            (_joy.get_numbuttons() > 5 and _joy.get_button(5))
+                            or (_joy.get_numbuttons() > 10 and _joy.get_button(10))
+                        )
+                    )
+                )  # RB: supports raw and SDL-style macOS mappings
                 if _cmd and side_fire_timer == 0:
                     side_shoot_pose_timer = SHOOT_POSE_FRAMES
                     if move_input.x > 0:
@@ -6025,6 +6137,7 @@ def main() -> None:
                     start_menu_music_file,
                     tutorial_img=tutorial_img,
                     tutorial_music_file=tutorial_music_file,
+                    controller=_joy,
                 )
             if music_file:
                 try:
@@ -6087,7 +6200,8 @@ def main() -> None:
                 restart = True
             elif action == "menu":
                 _start_menu(screen, clock, menu_img, start_menu_music_file,
-                            tutorial_img=tutorial_img, tutorial_music_file=tutorial_music_file)
+                            tutorial_img=tutorial_img, tutorial_music_file=tutorial_music_file,
+                            controller=_joy)
                 restart = True
             if restart and music_file:
                 try:
